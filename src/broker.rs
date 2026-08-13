@@ -173,7 +173,7 @@ pub async fn run(
         while cleanup_shared.active_attachments.load(Ordering::Acquire) != 0 {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let ttl = std::env::var("RPIPE_SESSION_TTL_SECS")
+        let ttl = std::env::var("PIPEKEEP_SESSION_TTL_SECS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(300_u64);
@@ -193,7 +193,7 @@ pub async fn run(
                 tokio::spawn(async move {
                     let _guard = ConnectionGuard(connection_shared.clone());
                     if let Err(error) = handle_connection(stream, connection_shared).await {
-                        eprintln!("rpipe broker connection: {error:#}");
+                        eprintln!("pipekeep broker connection: {error:#}");
                     }
                 });
             }
@@ -649,7 +649,7 @@ async fn cancel_process_group(shared: Arc<Shared>) -> Result<ExitResult> {
         Err(error) => return Err(error.into()),
     }
 
-    let grace = std::env::var("RPIPE_CANCEL_GRACE_SECS")
+    let grace = std::env::var("PIPEKEEP_CANCEL_GRACE_SECS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(3_u64);

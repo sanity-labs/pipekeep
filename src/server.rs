@@ -72,7 +72,7 @@ async fn start_broker(
     fs::set_permissions(session_dir, fs::Permissions::from_mode(0o700))?;
     let log_path = session_dir.join("broker.log");
     let log = fs::File::create(&log_path)?;
-    let executable = std::env::current_exe().context("cannot locate the rpipe executable")?;
+    let executable = std::env::current_exe().context("cannot locate the pipekeep executable")?;
     let mut broker = Command::new(executable);
     broker
         .arg("__broker")

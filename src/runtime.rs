@@ -5,12 +5,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 pub fn root_dir() -> Result<PathBuf> {
-    let root = if let Some(value) = std::env::var_os("RPIPE_RUNTIME_DIR") {
+    let root = if let Some(value) = std::env::var_os("PIPEKEEP_RUNTIME_DIR") {
         PathBuf::from(value)
     } else if let Some(value) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(value).join("rpipe")
+        PathBuf::from(value).join("pipekeep")
     } else {
-        std::env::temp_dir().join(format!("rpipe-{}", unsafe { libc::geteuid() }))
+        std::env::temp_dir().join(format!("pipekeep-{}", unsafe { libc::geteuid() }))
     };
     fs::create_dir_all(&root)
         .with_context(|| format!("cannot create runtime directory {}", root.display()))?;

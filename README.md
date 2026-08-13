@@ -1,22 +1,22 @@
-# rpipe
+# pipekeep
 
-`rpipe` keeps a non-interactive command connected across temporary transport
+`pipekeep` keeps a non-interactive command connected across temporary transport
 failures. It preserves ordinary byte-stream stdin and separate stdout/stderr,
 without allocating a pseudo-terminal.
 
 ```sh
 produce |
-  rpipe -- kubectl exec -i my-pod -- \
-    rpipe --id banana -- remote-command |
+  pipekeep -- kubectl exec -i my-pod -- \
+    pipekeep --id banana -- remote-command |
   consume
 ```
 
-The first `rpipe` restarts the opaque transport command after a disconnect.
+The first `pipekeep` restarts the opaque transport command after a disconnect.
 The second creates a detached broker beside the remote command, or reconnects
 to that broker using absolute stream positions. SSH works the same way:
 
 ```sh
-rpipe -- ssh host rpipe --id banana -- command
+pipekeep -- ssh host pipekeep --id banana -- command
 ```
 
 ## Build
@@ -26,17 +26,17 @@ cargo build --release
 cargo test
 ```
 
-`rpipe` currently targets Unix systems. Runtime state is stored under
-`$RPIPE_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/rpipe`, or `/tmp/rpipe-$UID` (in that
+`pipekeep` currently targets Unix systems. Runtime state is stored under
+`$PIPEKEEP_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/pipekeep`, or `/tmp/pipekeep-$UID` (in that
 order), with user-only permissions.
 
 ## Commands
 
 ```text
-rpipe [--nobuffer] [--] TRANSPORT [ARG...]
-rpipe --id ID [--nobuffer] -- COMMAND [ARG...]
-rpipe cancel --id ID
-rpipe pid --id ID
+pipekeep [--nobuffer] [--] TRANSPORT [ARG...]
+pipekeep --id ID [--nobuffer] -- COMMAND [ARG...]
+pipekeep cancel --id ID
+pipekeep pid --id ID
 ```
 
 `cancel` sends `SIGTERM` to the command process group, waits three seconds by
@@ -69,8 +69,8 @@ are ignored.
 
 ## Runtime tuning
 
-- `RPIPE_CANCEL_GRACE_SECS`: cancellation grace period (default `3`).
-- `RPIPE_SESSION_TTL_SECS`: completed-session replay lifetime (default `300`).
+- `PIPEKEEP_CANCEL_GRACE_SECS`: cancellation grace period (default `3`).
+- `PIPEKEEP_SESSION_TTL_SECS`: completed-session replay lifetime (default `300`).
 
 Replay buffers are process-lifetime aids, not durable storage. A broker keeps
 completed output for the TTL so an exit-frame transport failure can still be

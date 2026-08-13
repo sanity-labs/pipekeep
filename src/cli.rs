@@ -139,13 +139,13 @@ fn parse_broker(args: &[String]) -> Result<Mode> {
     })
 }
 
-pub const HELP: &str = r#"rpipe: resumable process pipes
+pub const HELP: &str = r#"pipekeep: resumable process pipes
 
 Usage:
-  rpipe [--nobuffer] [--] TRANSPORT [ARG...]
-  rpipe --id ID [--nobuffer] -- COMMAND [ARG...]
-  rpipe cancel --id ID
-  rpipe pid --id ID
+  pipekeep [--nobuffer] [--] TRANSPORT [ARG...]
+  pipekeep --id ID [--nobuffer] -- COMMAND [ARG...]
+  pipekeep cancel --id ID
+  pipekeep pid --id ID
 
 The outer form reruns TRANSPORT after a disconnection. The --id form creates
 or attaches to a detached process session using the opening protocol message.

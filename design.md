@@ -1,8 +1,8 @@
-# rpipe: resumable process pipes
+# pipekeep: resumable process pipes
 
 ## Purpose
 
-`rpipe` keeps a non-interactive process connected across temporary transport
+`pipekeep` keeps a non-interactive process connected across temporary transport
 failures. It preserves the useful shape of a normal process invocation:
 
 - stdin remains a byte stream into the process;
@@ -16,28 +16,28 @@ The primary use case is a command started through Kubernetes Exec:
 
 ```sh
 produce |
-  rpipe -- kubectl exec -i my-pod -- \
-    rpipe --id banana -- remote-command |
+  pipekeep -- kubectl exec -i my-pod -- \
+    pipekeep --id banana -- remote-command |
   consume
 ```
 
-The same design works over SSH because `rpipe` treats the transport as an
+The same design works over SSH because `pipekeep` treats the transport as an
 opaque command:
 
 ```sh
 produce |
-  rpipe -- ssh host rpipe --id banana -- remote-command |
+  pipekeep -- ssh host pipekeep --id banana -- remote-command |
   consume
 ```
 
-The outer `rpipe` exposes ordinary pipes locally. The inner `rpipe` owns the
+The outer `pipekeep` exposes ordinary pipes locally. The inner `pipekeep` owns the
 remote process and its pipes. If the transport exits, the outer process keeps
 its local pipes open, starts the same transport command again, and resumes the
 session.
 
 ## Scope
 
-`rpipe` does one thing: create, reconnect to, or cancel one process with one
+`pipekeep` does one thing: create, reconnect to, or cancel one process with one
 stdin writer and one stdout/stderr reader.
 
 It is not a terminal multiplexer, job scheduler, process supervisor, or remote
@@ -53,27 +53,27 @@ or the pod is replaced.
 
 ```text
 Usage:
-  rpipe [--] TRANSPORT [ARG...]
-  rpipe --id ID [--nobuffer] -- COMMAND [ARG...]
-  rpipe cancel --id ID
-  rpipe pid --id ID
+  pipekeep [--] TRANSPORT [ARG...]
+  pipekeep --id ID [--nobuffer] -- COMMAND [ARG...]
+  pipekeep cancel --id ID
+  pipekeep pid --id ID
 
 Modes:
-  rpipe -- TRANSPORT ...
+  pipekeep -- TRANSPORT ...
       Run a transport command. Re-run it after disconnection and resume the
-      rpipe protocol without closing local stdin, stdout, or stderr.
+      pipekeep protocol without closing local stdin, stdout, or stderr.
 
-  rpipe --id ID -- COMMAND ...
+  pipekeep --id ID -- COMMAND ...
       Create session ID and run COMMAND, or attach to that session when the
       opening protocol message requests a resume. Only one client may be
       attached at a time.
 
-  rpipe cancel --id ID
+  pipekeep cancel --id ID
       Request graceful termination, escalate if necessary, wait until the
       process group is settled, and return the command's authoritative
       terminal result.
 
-  rpipe pid --id ID
+  pipekeep pid --id ID
       Print the PID of the session's command. This permits normal operating
       system tools to be used for signalling and inspection.
 
@@ -93,8 +93,8 @@ Kubernetes, `-i` is required and `-t` must not be used.
 `cancel` is run where the session broker lives. For example:
 
 ```sh
-kubectl exec my-pod -- rpipe cancel --id banana
-ssh host rpipe cancel --id banana
+kubectl exec my-pod -- pipekeep cancel --id banana
+ssh host pipekeep cancel --id banana
 ```
 
 Cancellation sends `SIGTERM` to the command's process group, waits for a grace
@@ -110,7 +110,7 @@ terminal result. A session that does not exist is an error.
 
 ## Session model
 
-On first connection, the inner `rpipe` starts a small session broker and the
+On first connection, the inner `pipekeep` starts a small session broker and the
 requested command. The broker owns the child's three pipes and survives the
 loss of the particular Kubernetes Exec or SSH process that created it. Later
 invocations with the same ID connect to that broker.
@@ -150,7 +150,7 @@ frames:
 ```
 
 The returned stdin position is authoritative: it is the first stdin byte the
-server still needs. The outer `rpipe` retransmits from that point. The returned
+server still needs. The outer `pipekeep` retransmits from that point. The returned
 stdout and stderr positions are the first bytes the server can actually
 provide. They may be greater than requested when data was not retained.
 
@@ -187,7 +187,7 @@ a gap rather than silently renumbering the stream.
 
 By default, both ends retain data needed for a likely reconnect:
 
-- the outer `rpipe` retains stdin until the server advances its stdin position;
+- the outer `pipekeep` retains stdin until the server advances its stdin position;
 - the remote broker retains stdout and stderr until the client reconnects and
   requests them; and
 - normal backpressure applies when a configured retention limit is reached.
@@ -206,18 +206,18 @@ detect them from the offsets.
 
 ## Kubernetes Exec
 
-`rpipe` is designed to work through the Kubernetes remote-command API without
+`pipekeep` is designed to work through the Kubernetes remote-command API without
 Kubernetes-specific behavior in the protocol. An API client:
 
 1. opens an Exec request with stdin, stdout, and stderr enabled and TTY disabled;
-2. invokes `rpipe --id ID -- COMMAND ...` in the container;
+2. invokes `pipekeep --id ID -- COMMAND ...` in the container;
 3. sends the JSON handshake on stdin;
 4. parses the JSON response and subsequent frames;
 5. records the next delivered stdout and stderr offsets; and
 6. opens a new Exec request with those offsets after disconnection.
 
 The command line is identical on every attempt. Only the opening JSON object
-changes. The ordinary `kubectl` case uses the outer `rpipe` to perform these
+changes. The ordinary `kubectl` case uses the outer `pipekeep` to perform these
 steps and restart `kubectl exec` automatically.
 
 The binary must be available inside the target container. The session broker
@@ -229,17 +229,17 @@ why a replacement container cannot resume the session.
 SSH is simply another transport:
 
 ```sh
-rpipe -- ssh host rpipe --id banana -- command
+pipekeep -- ssh host pipekeep --id banana -- command
 ```
 
-No SSH extension is required. The outer `rpipe` reruns `ssh` after a broken
-connection, and the newly invoked inner `rpipe` attaches to the existing
+No SSH extension is required. The outer `pipekeep` reruns `ssh` after a broken
+connection, and the newly invoked inner `pipekeep` attaches to the existing
 broker. SSH authentication, host selection, jump hosts, and connection policy
 remain the responsibility of `ssh` and its configuration.
 
 ## Expected guarantees
 
-While the session and required buffers remain available, `rpipe` preserves
+While the session and required buffers remain available, `pipekeep` preserves
 byte order within each stream, prevents replayed stdin bytes from being written
 twice, and avoids replaying stdout or stderr already delivered by the same
 outer client.

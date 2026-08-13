@@ -1,5 +1,5 @@
 [package]
-name = "rpipe"
+name = "pipekeep"
 version = "0.1.0"
 edition = "2021"
 description = "Resumable process pipes"

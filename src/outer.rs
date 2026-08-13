@@ -56,7 +56,7 @@ pub async fn run(command: Vec<String>, nobuffer: bool) -> Result<i32> {
                     create = true;
                     continue;
                 }
-                bail!("remote rpipe: {error}");
+                bail!("remote pipekeep: {error}");
             }
         }
     }
@@ -115,8 +115,8 @@ async fn attempt(
         finish_transport(&mut child).await;
         return Ok(AttemptResult::ServerError(error.to_owned()));
     }
-    let server: ServerHello =
-        serde_json::from_value(value).context("transport returned an invalid rpipe handshake")?;
+    let server: ServerHello = serde_json::from_value(value)
+        .context("transport returned an invalid pipekeep handshake")?;
     if server.offsets.stdout < delivered.stdout || server.offsets.stderr < delivered.stderr {
         bail!("server moved an output position backwards");
     }

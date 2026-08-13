@@ -6,12 +6,12 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn binary() -> PathBuf {
-    assert_cmd::cargo::cargo_bin("rpipe")
+    assert_cmd::cargo::cargo_bin("pipekeep")
 }
 
 fn runtime_dir(label: &str) -> tempfile::TempDir {
     tempfile::Builder::new()
-        .prefix(&format!("rpipe-{label}-"))
+        .prefix(&format!("pipekeep-{label}-"))
         .tempdir_in("/tmp")
         .unwrap()
 }
@@ -20,8 +20,8 @@ fn outer_command(runtime: &Path, id: &str, shell: &str) -> Command {
     let binary = binary();
     let mut command = Command::new(&binary);
     command
-        .env("RPIPE_RUNTIME_DIR", runtime)
-        .env("RPIPE_SESSION_TTL_SECS", "2")
+        .env("PIPEKEEP_RUNTIME_DIR", runtime)
+        .env("PIPEKEEP_SESSION_TTL_SECS", "2")
         .arg("--")
         .arg(&binary)
         .arg("--id")
@@ -91,8 +91,8 @@ fi
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
 
     let output = Command::new(&binary)
-        .env("RPIPE_RUNTIME_DIR", runtime.path())
-        .env("RPIPE_SESSION_TTL_SECS", "2")
+        .env("PIPEKEEP_RUNTIME_DIR", runtime.path())
+        .env("PIPEKEEP_SESSION_TTL_SECS", "2")
         .arg("--")
         .arg(&script)
         .stdin(Stdio::null())
@@ -111,7 +111,7 @@ fn pid_and_cancel_control_the_command_group() {
     let runtime = runtime_dir("cancel");
     let binary = binary();
     let mut outer = outer_command(runtime.path(), "cancel-me", "printf R; sleep 30")
-        .env("RPIPE_CANCEL_GRACE_SECS", "0")
+        .env("PIPEKEEP_CANCEL_GRACE_SECS", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -127,7 +127,7 @@ fn pid_and_cancel_control_the_command_group() {
     assert_eq!(&byte, b"R");
 
     let pid = Command::new(&binary)
-        .env("RPIPE_RUNTIME_DIR", runtime.path())
+        .env("PIPEKEEP_RUNTIME_DIR", runtime.path())
         .args(["pid", "--id", "cancel-me"])
         .output()
         .unwrap();
@@ -139,8 +139,8 @@ fn pid_and_cancel_control_the_command_group() {
         .is_ok());
 
     let canceled = Command::new(&binary)
-        .env("RPIPE_RUNTIME_DIR", runtime.path())
-        .env("RPIPE_CANCEL_GRACE_SECS", "0")
+        .env("PIPEKEEP_RUNTIME_DIR", runtime.path())
+        .env("PIPEKEEP_CANCEL_GRACE_SECS", "0")
         .args(["cancel", "--id", "cancel-me"])
         .status()
         .unwrap();
@@ -154,7 +154,7 @@ fn pid_and_cancel_control_the_command_group() {
             assert_eq!(status.code(), Some(143));
             break;
         }
-        assert!(Instant::now() < deadline, "outer rpipe did not exit");
+        assert!(Instant::now() < deadline, "outer pipekeep did not exit");
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -164,8 +164,8 @@ fn nobuffer_mode_preserves_live_streams() {
     let runtime = runtime_dir("nobuffer");
     let binary = binary();
     let mut child = Command::new(&binary)
-        .env("RPIPE_RUNTIME_DIR", runtime.path())
-        .env("RPIPE_SESSION_TTL_SECS", "2")
+        .env("PIPEKEEP_RUNTIME_DIR", runtime.path())
+        .env("PIPEKEEP_SESSION_TTL_SECS", "2")
         .args(["--nobuffer", "--"])
         .arg(&binary)
         .args([

@@ -13,7 +13,7 @@ async fn main() {
     let code = match run().await {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("rpipe: {error:#}");
+            eprintln!("pipekeep: {error:#}");
             1
         }
     };
@@ -41,7 +41,7 @@ async fn run() -> Result<i32> {
             Ok(0)
         }
         Mode::Version => {
-            println!("rpipe {}", env!("CARGO_PKG_VERSION"));
+            println!("pipekeep {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
     }
