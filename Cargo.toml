@@ -1,0 +1,19 @@
+[package]
+name = "rpipe"
+version = "0.1.0"
+edition = "2021"
+description = "Resumable process pipes"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+libc = "0.2"
+nix = { version = "0.29", features = ["process", "signal"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.12"
+tokio = { version = "1.40", features = ["full"] }
+
+[dev-dependencies]
+assert_cmd = "2.0"
