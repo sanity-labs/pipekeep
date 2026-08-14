@@ -390,6 +390,19 @@ struct InputMeta {
     live: VecDeque<u8>,
 }
 
+impl InputMeta {
+    // The nobuffer input backlog is a bounded rolling window: only the newest
+    // LIVE_STDIN_CAPACITY bytes stay replayable, and live_base advances past
+    // everything discarded so absolute offsets expose the unretained range.
+    fn retain_live_tail(&mut self, data: &[u8]) {
+        self.live.extend(data);
+        while self.live.len() > LIVE_STDIN_CAPACITY {
+            self.live.pop_front();
+            self.live_base += 1;
+        }
+    }
+}
+
 struct InputBuffer {
     meta: Mutex<InputMeta>,
     changed: Notify,
@@ -486,11 +499,7 @@ async fn read_local_stdin(input: Arc<InputBuffer>, mut file: Option<File>) {
                 let mut meta = input.meta.lock().await;
                 meta.end += count as u64;
                 if file.is_none() {
-                    meta.live.extend(&buffer[..count]);
-                    while meta.live.len() > LIVE_STDIN_CAPACITY {
-                        meta.live.pop_front();
-                        meta.live_base += 1;
-                    }
+                    meta.retain_live_tail(&buffer[..count]);
                 }
                 drop(meta);
                 input.changed.notify_waiters();
@@ -542,6 +551,85 @@ async fn send_raw_stdin<W: AsyncWrite + Unpin>(
                 return result;
             }
             InputPart::Wait => notified.await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live_input(chunks: &[&[u8]]) -> InputBuffer {
+        let mut meta = InputMeta::default();
+        for chunk in chunks {
+            meta.end += chunk.len() as u64;
+            meta.retain_live_tail(chunk);
+        }
+        InputBuffer {
+            meta: Mutex::new(meta),
+            changed: Notify::new(),
+            file: None,
+        }
+    }
+
+    #[test]
+    fn live_stdin_window_keeps_newest_bounded_tail() {
+        let mut meta = InputMeta::default();
+        meta.end += LIVE_STDIN_CAPACITY as u64;
+        meta.retain_live_tail(&vec![b'a'; LIVE_STDIN_CAPACITY]);
+        assert_eq!(meta.live_base, 0);
+        assert_eq!(meta.live.len(), LIVE_STDIN_CAPACITY);
+
+        meta.end += 3;
+        meta.retain_live_tail(b"xyz");
+        assert_eq!(meta.live_base, 3);
+        assert_eq!(meta.live.len(), LIVE_STDIN_CAPACITY);
+        assert!(meta
+            .live
+            .iter()
+            .skip(LIVE_STDIN_CAPACITY - 3)
+            .eq(b"xyz".iter()));
+    }
+
+    #[tokio::test]
+    async fn live_stdin_replays_retained_tail_and_exposes_discarded_range() {
+        let discarded = 100_usize;
+        let head = vec![b'a'; LIVE_STDIN_CAPACITY];
+        let tail = vec![b'b'; discarded];
+        let input = live_input(&[&head, &tail]);
+        let base = discarded as u64;
+        let end = (LIVE_STDIN_CAPACITY + discarded) as u64;
+
+        // The opening handshake advertises the first retained byte.
+        let state = input.attachment_state().await;
+        assert_eq!(state.start, base);
+        assert_eq!(state.eof, None);
+
+        // A position inside the window replays exactly the retained bytes.
+        match input.next(LIVE_STDIN_CAPACITY as u64).await.unwrap() {
+            InputPart::Data { offset, data } => {
+                assert_eq!(offset, LIVE_STDIN_CAPACITY as u64);
+                assert_eq!(data, tail);
+            }
+            _ => panic!("expected retained data"),
+        }
+
+        // A position before the window jumps forward to the retained base:
+        // the discarded range appears as an offset gap, never as other bytes.
+        match input.next(0).await.unwrap() {
+            InputPart::Data { offset, data } => {
+                assert_eq!(offset, base);
+                assert!(data.iter().all(|byte| *byte == b'a'));
+            }
+            _ => panic!("expected data at the retained base"),
+        }
+
+        // Nothing beyond the end until EOF is recorded.
+        assert!(matches!(input.next(end).await.unwrap(), InputPart::Wait));
+        input.meta.lock().await.eof = true;
+        match input.next(end).await.unwrap() {
+            InputPart::Eof { offset } => assert_eq!(offset, end),
+            _ => panic!("expected EOF at the absolute end"),
         }
     }
 }

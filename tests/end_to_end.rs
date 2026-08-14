@@ -612,6 +612,148 @@ fn removes_completed_session_after_short_ttl() {
         .contains("session does not exist"));
 }
 
+// In --nobuffer mode a live attachment relays output through a small fixed
+// broker-side queue. When the client falls behind and the queue overruns, the
+// broker emits a forward-offset chunk and the short-lived proxy must close
+// the attachment WITHOUT writing a pipekeep diagnostic to its public stderr:
+// after the handshake that stream carries native command stderr, and any
+// injected diagnostic would be counted by the outer wrapper as delivered
+// command bytes and poison the next absolute stderr resume offset. The flood
+// is written while this test reads nothing, so far more data passes through
+// the broker than the live queue plus every transport buffer can absorb and
+// the overrun is deterministic, not timing-dependent.
+#[test]
+fn nobuffer_live_queue_overrun_closes_attachment_without_public_diagnostics() {
+    let runtime = runtime_dir("live-gap");
+    let binary = binary();
+    const FLOOD: usize = 32 * 1024 * 1024;
+    let attached = runtime.path().join("attached");
+    let sync = runtime.path().join("sync");
+    let done = runtime.path().join("done");
+    let finish = runtime.path().join("finish");
+    // In nobuffer mode output produced before the attachment subscribes is
+    // discarded, so the command holds every write until the test confirms the
+    // attachment (and later the stderr delivery) through flag files. It also
+    // stays alive until the gap has been observed: at command exit the broker
+    // resolves outstanding gaps at the terminal boundary instead, which is
+    // not the path under test.
+    let script = format!(
+        "while [ ! -e '{}' ]; do sleep 0.05; done; printf real-stderr >&2; \
+         while [ ! -e '{}' ]; do sleep 0.05; done; \
+         head -c {FLOOD} /dev/zero; touch '{}'; \
+         while [ ! -e '{}' ]; do sleep 0.05; done",
+        attached.display(),
+        sync.display(),
+        done.display(),
+        finish.display()
+    );
+    let mut first = Command::new(&binary)
+        .env("PIPEKEEP_RUNTIME_DIR", runtime.path())
+        .env("PIPEKEEP_SESSION_TTL_SECS", "30")
+        .args([
+            "--id",
+            "live-gap",
+            "--nobuffer",
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Keep stdin open for the whole attachment so the proxy can only end
+    // through its output path, never through a benign local stdin EOF.
+    let mut first_input = first.stdin.take().unwrap();
+    first_input.write_all(b"{}\n").unwrap();
+    first_input.flush().unwrap();
+    let mut first_output = first.stdout.take().unwrap();
+    let mut first_error = first.stderr.take().unwrap();
+    let header = read_json_line(&mut first_output);
+    assert_eq!(header["offsets"]["stdout"], 0);
+    assert_eq!(header["offsets"]["stderr"], 0);
+    fs::write(&attached, b"").unwrap();
+
+    // Genuine command stderr passes through unchanged while the stream flows.
+    let mut real = [0_u8; 11];
+    first_error.read_exact(&mut real).unwrap();
+    assert_eq!(&real, b"real-stderr");
+
+    // Release the flood and wait until the command has written all of it.
+    fs::write(&sync, b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "command did not finish the flood"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut body = Vec::new();
+    first_output.read_to_end(&mut body).unwrap();
+    let mut late_error = Vec::new();
+    first_error.read_to_end(&mut late_error).unwrap();
+    let status = first.wait().unwrap();
+    drop(first_input);
+
+    // The attachment failed on the queue gap rather than skipping bytes...
+    assert_eq!(status.code(), Some(1));
+    assert!(body.len() < FLOOD, "no overrun: {} delivered", body.len());
+    // ...and the public streams carried only native command bytes: the
+    // delivered stdout prefix is intact and stderr received no diagnostic.
+    assert!(body.iter().all(|byte| *byte == 0));
+    assert_eq!(
+        late_error,
+        b"",
+        "public stderr was contaminated: {}",
+        String::from_utf8_lossy(&late_error)
+    );
+
+    // A reconnect using only actually delivered byte counts advances to the
+    // live positions at its opening handshake and replays the retained exit.
+    // Terminal state is asynchronous to the finish flag, so attach again
+    // until the broker reports it.
+    fs::write(&finish, b"").unwrap();
+    let request = format!(
+        "{{\"offsets\":{{\"stdout\":{},\"stderr\":11}}}}\n",
+        body.len()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let output = loop {
+        let mut second = attachment(runtime.path(), "live-gap", "unused-on-attach");
+        second
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(request.as_bytes())
+            .unwrap();
+        let output = second.wait_with_output().unwrap();
+        let (header, _) = split_header(&output.stdout);
+        if header.get("exit").is_some() {
+            break output;
+        }
+        assert!(Instant::now() < deadline, "command never became terminal");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (header, rest) = split_header(&output.stdout);
+    assert_eq!(header["offsets"]["stdout"], FLOOD);
+    assert_eq!(header["offsets"]["stderr"], 11);
+    assert_eq!(header["stdout_eof"], FLOOD);
+    assert_eq!(header["stderr_eof"], 11);
+    assert_eq!(header["exit"]["code"], 0);
+    assert_eq!(rest, b"");
+    assert_eq!(output.stderr, b"");
+}
+
 // The outer wrapper reads the transport command's merged stderr. Diagnostics
 // written by the transport itself are indistinguishable from remote command
 // stderr and advance the outer stderr position, so exact stderr resume

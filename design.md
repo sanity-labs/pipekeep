@@ -82,8 +82,10 @@ Options:
       Name the remote session.
 
   --nobuffer
-      Do not retain disconnected stream data. Counters still advance and the
-      protocol still reports offsets, but unavailable bytes are skipped.
+      Do not spool unbounded replay data. The outer form keeps only a bounded
+      64 KiB rolling stdin tail; the inner form keeps no disconnected output
+      backlog. Counters still advance and the protocol still reports offsets,
+      and bytes no longer retained are omitted at the next reattachment.
 ```
 
 The transport command is deliberately unspecified. It can be `kubectl exec`,
@@ -288,18 +290,23 @@ Replay is best effort, not durable storage. Process loss, local client loss,
 or session cleanup can make bytes unavailable. Absolute offsets make such gaps
 detectable by protocol clients.
 
-With `--nobuffer`, the protocol is unchanged but neither side holds a backlog
-for a disconnected peer. The remote broker continues draining and discarding
-stdout and stderr so the command can run. The outer process continues draining
-and discarding stdin so the producer can run. On reconnect, the returned
-positions advance to the first currently available bytes, and the transparent
-local pipes omit the range that was missed while disconnected. Gap omission
+With `--nobuffer`, the protocol is unchanged but disconnected backlog is
+bounded or absent. The remote broker holds no disconnected output backlog: it
+continues draining and discarding stdout and stderr so the command can run.
+The outer process keeps the producer running by retaining only the newest
+64 KiB of stdin as a bounded rolling window, whose first retained byte it
+advertises as `stdin_start`: a short detachment can replay that tail without a
+gap, while older stdin is discarded as the window advances. On reconnect, the
+returned positions advance to the first currently available bytes, and the
+transparent local pipes omit any range no longer retained. Gap omission
 happens only at that reattachment boundary: within a live attachment, output
 is relayed through a small fixed queue, and a client that falls behind it
-causes the attachment to fail (the short-lived remote proxy reports a gap and
-exits) rather than having bytes silently skipped mid-stream. The following
-reconnect then skips to the live positions as usual. A caller using the
-protocol directly can detect every gap from the offsets.
+causes the attachment to close — the short-lived remote proxy detects the
+resulting offset gap and exits without writing any diagnostic to the public
+command streams, which after the handshake carry only native command bytes —
+rather than having bytes silently skipped mid-stream. The next attachment then
+advances to the live positions at its opening handshake as usual. A caller
+using the protocol directly can detect every gap from the offsets.
 
 ## Kubernetes Exec
 

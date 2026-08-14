@@ -173,7 +173,7 @@ async fn connect_existing(session_dir: &Path) -> Result<UnixStream> {
 async fn proxy_attachment(
     external_input: Stdin,
     mut external_output: Stdout,
-    mut external_error: Stderr,
+    external_error: Stderr,
     mut broker: UnixStream,
     offsets: OutputOffsets,
     stdin_start: u64,
@@ -207,6 +207,31 @@ async fn proxy_attachment(
         .context("broker returned an invalid attachment header")?;
     write_json_line(&mut external_output, &hello).await?;
 
+    // After the handshake, stdout and stderr belong to the command. A
+    // pipekeep diagnostic written to either stream would be counted by the
+    // public client as delivered command bytes and poison its resume offsets,
+    // so an internal failure closes the attachment silently; the client sees
+    // the transport end and reattaches at real byte positions.
+    Ok(relay_streams(
+        external_input,
+        external_output,
+        external_error,
+        broker,
+        hello,
+        stdin_eof,
+    )
+    .await
+    .unwrap_or(1))
+}
+
+async fn relay_streams(
+    external_input: Stdin,
+    mut external_output: Stdout,
+    mut external_error: Stderr,
+    broker: UnixStream,
+    hello: ServerHello,
+    stdin_eof: Option<u64>,
+) -> Result<i32> {
     let stdin_position = hello.offsets.stdin;
     let stdin_already_eof = hello.stdin_eof;
     let mut stdout_position = hello.offsets.stdout;

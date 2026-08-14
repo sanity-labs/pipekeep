@@ -50,9 +50,12 @@ and the broker spools stdout/stderr in its private session directory. Both
 retentions are unbounded within a session — they grow with the total amount of
 data passed through, with no configurable retention limit or backpressure —
 which suits controlled experiments with bounded output. With `--nobuffer`,
-disconnected bytes are discarded and absolute offsets expose the resulting
-gaps at the next reattachment. Apply `--nobuffer` to both the outer and inner
-invocation when input should also use discard semantics.
+the inner broker keeps no disconnected output backlog, while the outer wrapper
+retains the newest 64 KiB of stdin as a bounded rolling window: a short
+detachment can replay that tail without a gap, and older input is discarded as
+the window advances. Absolute offsets expose any range no longer retained at
+the next reattachment. Apply `--nobuffer` to both the outer and inner
+invocation when input should also use bounded-window semantics.
 
 ## Compatibility probe
 
