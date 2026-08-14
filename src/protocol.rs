@@ -2,6 +2,10 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Version of the public attachment handshake and its sticky-state semantics.
+/// Compatible additions keep this number; an incompatible change bumps it.
+pub const ATTACHMENT_PROTOCOL_VERSION: u32 = 1;
+
 pub const MAX_JSON_LINE: usize = 64 * 1024;
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 

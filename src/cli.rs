@@ -26,6 +26,7 @@ pub enum Mode {
     },
     Help,
     Version,
+    Capabilities,
 }
 
 pub fn parse(mut args: Vec<String>) -> Result<Mode> {
@@ -38,6 +39,7 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
         "--version" | "-V" => return Ok(Mode::Version),
         "cancel" => return parse_control(&args[1..], true),
         "pid" => return parse_control(&args[1..], false),
+        "capabilities" => return parse_capabilities(&args[1..]),
         "__broker" => return parse_broker(&args[1..]),
         _ => {}
     }
@@ -139,6 +141,14 @@ fn parse_broker(args: &[String]) -> Result<Mode> {
     })
 }
 
+fn parse_capabilities(args: &[String]) -> Result<Mode> {
+    match args {
+        [] => bail!("capabilities requires --json; only machine-readable output is provided"),
+        [flag] if flag == "--json" => Ok(Mode::Capabilities),
+        _ => bail!("capabilities accepts exactly one argument: --json"),
+    }
+}
+
 pub const HELP: &str = r#"pipekeep: resumable process pipes
 
 Usage:
@@ -146,9 +156,12 @@ Usage:
   pipekeep --id ID [--nobuffer] -- COMMAND [ARG...]
   pipekeep cancel --id ID
   pipekeep pid --id ID
+  pipekeep capabilities --json
+  pipekeep --version
 
 The outer form reruns TRANSPORT after a disconnection. The --id form creates
 or attaches to a detached process session using the opening protocol message.
+`capabilities --json` prints a machine-readable compatibility probe.
 "#;
 
 #[cfg(test)]
@@ -165,5 +178,16 @@ mod tests {
             parse(vec!["--id".into(), "x".into(), "--".into(), "cat".into()]).unwrap(),
             Mode::Server { .. }
         ));
+    }
+
+    #[test]
+    fn parses_capabilities_probe_strictly() {
+        assert!(matches!(
+            parse(vec!["capabilities".into(), "--json".into()]).unwrap(),
+            Mode::Capabilities
+        ));
+        assert!(parse(vec!["capabilities".into()]).is_err());
+        assert!(parse(vec!["capabilities".into(), "--text".into()]).is_err());
+        assert!(parse(vec!["capabilities".into(), "--json".into(), "extra".into()]).is_err());
     }
 }

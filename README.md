@@ -37,6 +37,8 @@ pipekeep [--nobuffer] [--] TRANSPORT [ARG...]
 pipekeep --id ID [--nobuffer] -- COMMAND [ARG...]
 pipekeep cancel --id ID
 pipekeep pid --id ID
+pipekeep capabilities --json
+pipekeep --version
 ```
 
 `cancel` sends `SIGTERM` to the command process group, waits three seconds by
@@ -44,10 +46,28 @@ default, then sends `SIGKILL` if needed. It returns the command's actual final
 status. `pid` prints the command leader's PID.
 
 By default, stdin replay uses an unlinked temporary file in the outer process,
-and the broker spools stdout/stderr in its private session directory. With
-`--nobuffer`, disconnected bytes are discarded and absolute offsets expose
-the resulting gaps. Apply `--nobuffer` to both the outer and inner invocation
-when input should also use discard semantics.
+and the broker spools stdout/stderr in its private session directory. Both
+retentions are unbounded within a session — they grow with the total amount of
+data passed through, with no configurable retention limit or backpressure —
+which suits controlled experiments with bounded output. With `--nobuffer`,
+disconnected bytes are discarded and absolute offsets expose the resulting
+gaps at the next reattachment. Apply `--nobuffer` to both the outer and inner
+invocation when input should also use discard semantics.
+
+## Compatibility probe
+
+`pipekeep capabilities --json` prints one compact JSON line an upper layer can
+use to verify it is talking to a compatible binary:
+
+```json
+{"capabilities":["raw-public-streams","absolute-resume-offsets","sticky-stdin-eof","separate-stdout-stderr","process-group-cancel","terminal-replay","nobuffer"],"name":"pipekeep","protocol":1,"revision":"<source revision>","version":"0.1.0"}
+```
+
+`protocol` is the attachment protocol version described below. `revision` is
+the build's source revision: exact builds set `PIPEKEEP_BUILD_REV` at compile
+time, a Git checkout falls back to its current commit, and `unknown` is used
+when neither is available. `pipekeep --version` reports the same revision.
+Any other `capabilities` invocation is rejected with an error.
 
 ## Attachment protocol
 
@@ -80,6 +100,26 @@ See [design.md](design.md) for the complete reconnection rules.
 - `PIPEKEEP_CANCEL_GRACE_SECS`: cancellation grace period (default `3`).
 - `PIPEKEEP_SESSION_TTL_SECS`: completed-session replay lifetime (default `300`).
 
+Both are read by the detached session broker from its own environment, which
+is captured when the session is created. Set them in the environment of the
+session-creating remote invocation; later attachments and `cancel` invocations
+cannot change them.
+
 Replay buffers are process-lifetime aids, not durable storage. A broker keeps
 completed output and exit state for the TTL so a final transport failure can
 still be resumed.
+
+## Transport stderr limitation
+
+An opaque transport CLI such as `ssh` or `kubectl` merges its own diagnostics
+into the same stderr stream that carries the remote command's stderr, so the
+outer `pipekeep` cannot tell them apart. Diagnostics a failing transport writes
+after a successful handshake are counted as delivered remote stderr and
+invalidate exact stderr resume accounting: the next reattachment either fails
+with an offset error (when the miscount points beyond the remote stream) or
+silently misses the overcounted remote bytes. Callers that need reliable
+recovery should use a transport or API that exposes command stderr separately
+from transport errors — the native Kubernetes remote-command API keeps its
+protocol error channel separate — or ensure the transport exits without
+writing stderr diagnostics (for example `ssh -q`). See
+[design.md](design.md) for the full analysis.

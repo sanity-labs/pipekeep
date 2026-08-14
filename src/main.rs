@@ -41,8 +41,34 @@ async fn run() -> Result<i32> {
             Ok(0)
         }
         Mode::Version => {
-            println!("pipekeep {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "pipekeep {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                env!("PIPEKEEP_BUILD_REVISION")
+            );
+            Ok(0)
+        }
+        Mode::Capabilities => {
+            println!("{}", capabilities());
             Ok(0)
         }
     }
+}
+
+fn capabilities() -> serde_json::Value {
+    serde_json::json!({
+        "name": "pipekeep",
+        "version": env!("CARGO_PKG_VERSION"),
+        "revision": env!("PIPEKEEP_BUILD_REVISION"),
+        "protocol": protocol::ATTACHMENT_PROTOCOL_VERSION,
+        "capabilities": [
+            "raw-public-streams",
+            "absolute-resume-offsets",
+            "sticky-stdin-eof",
+            "separate-stdout-stderr",
+            "process-group-cancel",
+            "terminal-replay",
+            "nobuffer",
+        ],
+    })
 }

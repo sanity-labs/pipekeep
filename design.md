@@ -115,6 +115,12 @@ requested command. The broker owns the child's three pipes and survives the
 loss of the particular Kubernetes Exec or SSH process that created it. Later
 invocations with the same ID connect to that broker.
 
+Broker tunables — `PIPEKEEP_SESSION_TTL_SECS` and `PIPEKEEP_CANCEL_GRACE_SECS`
+— are read by the broker from its own environment, which is inherited from the
+invocation that created the session. Later attachments and `cancel`
+invocations cannot change them; set them in the environment of the
+session-creating remote invocation.
+
 A session has at most one attached data client. A second data attachment is
 rejected, although idempotent control requests such as an EOF declaration may
 run alongside it. This avoids ambiguous stdin ownership and
@@ -194,7 +200,11 @@ can therefore replay through the advertised ends and return the retained exit
 status without trusting the status of the particular transport invocation.
 
 Unknown JSON fields are ignored. A future incompatible protocol can add an
-explicit version field and reject versions it cannot understand.
+explicit version field and reject versions it cannot understand. The
+`pipekeep capabilities --json` probe reports this handshake as attachment
+protocol `1`, together with the package version, the build's source revision,
+and the supported capability names, so an upper layer can verify binary
+compatibility before creating sessions.
 
 ## Raw stream transport
 
@@ -223,26 +233,73 @@ client where to restart stdin, while the client tells the server where to
 restart stdout and stderr. A forward jump in an opening response denotes a gap
 rather than silently renumbering a stream.
 
+## Transport stderr ambiguity in the outer wrapper
+
+An opaque transport CLI such as `ssh` or `kubectl` merges diagnostics from the
+transport itself into the same stderr stream that carries the remote command's
+stderr. The outer `pipekeep` reads that merged stream, so it fundamentally
+cannot distinguish remote command stderr from transport-emitted diagnostics
+(for example an SSH `packet_write_wait` or connection-closed message written
+when a connection breaks).
+
+The consequence is precise: every stderr byte the outer wrapper delivers
+advances its stderr resume position, so diagnostics injected by a failing
+transport are counted as delivered remote stderr. The next reattachment then
+requests a stderr position that is too far ahead. If it is beyond the remote
+stream's end, the broker rejects the attachment ("requested output offset is
+ahead of the stream") and the outer wrapper fails rather than corrupting the
+stream. If it still falls inside the remote stream, the overcounted remote
+bytes are never delivered locally. Exact stderr resume accounting is therefore
+invalid after a transport that injects stderr diagnostics; `pipekeep` does not
+clamp offsets or skip bytes to paper over this, because doing so would turn a
+detectable failure into silent corruption.
+
+Callers that require reliable stderr recovery should either:
+
+- use a transport or API that carries command stderr and transport errors on
+  separate channels — the native Kubernetes remote-command API keeps its
+  protocol error channel separate from the command's stderr stream, and is the
+  intended integration seam for native clients; or
+- ensure the transport command exits without writing diagnostics to stderr
+  (for example `ssh -q` disables most diagnostic output).
+
+Diagnostics from a transport attempt whose handshake never completes are not
+counted: the outer wrapper starts relaying and counting stderr only after a
+successful handshake, and abandons a failed attempt's stderr unread. Once a
+handshake has succeeded, every stderr byte of that attempt is counted,
+including any the transport wrote while the handshake was in flight.
+
 ## Buffering and gaps
 
 By default, both ends retain data needed for a likely reconnect:
 
-- the outer `pipekeep` retains stdin until the server advances its stdin position;
-- the remote broker retains stdout and stderr until the client reconnects and
-  requests them; and
-- normal backpressure applies when a configured retention limit is reached.
+- the outer `pipekeep` retains all stdin in an unlinked temporary file so any
+  server-requested restart position can be replayed; and
+- the remote broker spools all stdout and stderr to files in its private
+  session directory so a reconnecting client can request any position.
+
+Neither retention is bounded: within a session, spooling grows with the total
+amount of data that has passed through, and no retention or backpressure limit
+is configurable. This is deliberate for controlled experimentation with
+bounded-output commands; `--nobuffer` is the bounded alternative for streams
+that are too large to spool.
 
 Replay is best effort, not durable storage. Process loss, local client loss,
-retention limits, or cleanup can make bytes unavailable. Absolute offsets make
-such gaps detectable by protocol clients.
+or session cleanup can make bytes unavailable. Absolute offsets make such gaps
+detectable by protocol clients.
 
 With `--nobuffer`, the protocol is unchanged but neither side holds a backlog
 for a disconnected peer. The remote broker continues draining and discarding
 stdout and stderr so the command can run. The outer process continues draining
 and discarding stdin so the producer can run. On reconnect, the returned
-positions advance to the first currently available bytes. The transparent
-local pipes omit the missing ranges; a caller using the protocol directly can
-detect them from the offsets.
+positions advance to the first currently available bytes, and the transparent
+local pipes omit the range that was missed while disconnected. Gap omission
+happens only at that reattachment boundary: within a live attachment, output
+is relayed through a small fixed queue, and a client that falls behind it
+causes the attachment to fail (the short-lived remote proxy reports a gap and
+exits) rather than having bytes silently skipped mid-stream. The following
+reconnect then skips to the live positions as usual. A caller using the
+protocol directly can detect every gap from the offsets.
 
 ## Kubernetes Exec
 
