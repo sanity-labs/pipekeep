@@ -67,6 +67,7 @@ fn capabilities() -> serde_json::Value {
             "sticky-stdin-eof",
             "separate-stdout-stderr",
             "process-group-cancel",
+            "cancel-outcome",
             "terminal-replay",
             "nobuffer",
         ],

@@ -1,6 +1,6 @@
 use crate::protocol::{
-    read_frame, read_line, write_error_line, write_frame, write_json_line, AllOffsets, ExitResult,
-    Frame, OutputOffsets, ServerHello,
+    read_frame, read_line, write_error_line, write_frame, write_json_line, AllOffsets,
+    CancelOutcome, ExitResult, Frame, OutputOffsets, ServerHello,
 };
 use crate::runtime;
 use anyhow::{bail, Context, Result};
@@ -289,7 +289,13 @@ async fn handle_connection(mut stream: UnixStream, shared: Arc<Shared>) -> Resul
             write_json_line(&mut stream, &serde_json::json!({"pid": shared.command_pid})).await
         }
         Request::Cancel => match cancel_process_group(shared.clone()).await {
-            Ok(result) => write_json_line(&mut stream, &serde_json::json!({"exit": result})).await,
+            Ok((outcome, result)) => {
+                write_json_line(
+                    &mut stream,
+                    &serde_json::json!({"exit": result, "outcome": outcome}),
+                )
+                .await
+            }
             Err(error) => write_error_line(&mut stream, &error.to_string()).await,
         },
         Request::Attach {
@@ -763,12 +769,18 @@ async fn send_live_chunk<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn cancel_process_group(shared: Arc<Shared>) -> Result<ExitResult> {
+async fn cancel_process_group(shared: Arc<Shared>) -> Result<(CancelOutcome, ExitResult)> {
     let pgid = Pid::from_raw(shared.command_pid);
-    match signal::killpg(pgid, Signal::SIGTERM) {
-        Ok(()) | Err(Errno::ESRCH) => {}
+    // Each signal attempt doubles as the liveness inspection: Ok means the
+    // signal reached at least one remaining group member, ESRCH means the
+    // group had already settled before anything could be signaled. Deciding
+    // the outcome from the attempts themselves keeps the group-disappeared
+    // race honest — a group gone by signal time is never counted as won.
+    let mut signaled = match signal::killpg(pgid, Signal::SIGTERM) {
+        Ok(()) => true,
+        Err(Errno::ESRCH) => false,
         Err(error) => return Err(error.into()),
-    }
+    };
 
     let grace = std::env::var("PIPEKEEP_CANCEL_GRACE_SECS")
         .ok()
@@ -780,7 +792,8 @@ async fn cancel_process_group(shared: Arc<Shared>) -> Result<ExitResult> {
     }
     if group_exists(pgid) {
         match signal::killpg(pgid, Signal::SIGKILL) {
-            Ok(()) | Err(Errno::ESRCH) => {}
+            Ok(()) => signaled = true,
+            Err(Errno::ESRCH) => {}
             Err(error) => return Err(error.into()),
         }
     }
@@ -791,9 +804,16 @@ async fn cancel_process_group(shared: Arc<Shared>) -> Result<ExitResult> {
     let terminal = shared.terminal.subscribe();
     wait_for_true(terminal).await;
     let meta = shared.meta.lock().await;
-    meta.status
+    let status = meta
+        .status
         .clone()
-        .context("command has no terminal result")
+        .context("command has no terminal result")?;
+    let outcome = if signaled {
+        CancelOutcome::CancelWon
+    } else {
+        CancelOutcome::AlreadyExited
+    };
+    Ok((outcome, status))
 }
 
 fn group_exists(pgid: Pid) -> bool {

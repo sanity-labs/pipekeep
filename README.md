@@ -42,8 +42,13 @@ pipekeep --version
 ```
 
 `cancel` sends `SIGTERM` to the command process group, waits three seconds by
-default, then sends `SIGKILL` if needed. It returns the command's actual final
-status. `pid` prints the command leader's PID.
+default, then sends `SIGKILL` if needed. It exits with the command's actual
+final status and prints one machine-readable JSON line such as
+`{"exit":{"signal":15},"outcome":"cancel_won"}`. The `outcome` is
+`cancel_won` when the TERM or KILL attempt reached at least one still-live
+group member and `already_exited` when the group had already settled before
+anything could be signaled; the retained exit result is never relabeled by
+the outcome. `pid` prints the command leader's PID.
 
 By default, stdin replay uses an unlinked temporary file in the outer process,
 and the broker spools stdout/stderr in its private session directory. Both
@@ -63,7 +68,7 @@ invocation when input should also use bounded-window semantics.
 use to verify it is talking to a compatible binary:
 
 ```json
-{"capabilities":["raw-public-streams","absolute-resume-offsets","sticky-stdin-eof","separate-stdout-stderr","process-group-cancel","terminal-replay","nobuffer"],"name":"pipekeep","protocol":1,"revision":"<source revision>","version":"0.1.0"}
+{"capabilities":["raw-public-streams","absolute-resume-offsets","sticky-stdin-eof","separate-stdout-stderr","process-group-cancel","cancel-outcome","terminal-replay","nobuffer"],"name":"pipekeep","protocol":1,"revision":"<source revision>","version":"0.1.0"}
 ```
 
 `protocol` is the attachment protocol version described below. `revision` is

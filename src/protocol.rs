@@ -63,6 +63,19 @@ pub struct ExitResult {
     pub signal: Option<i32>,
 }
 
+/// Broker verdict on a cancellation request. `CancelWon` is reported only
+/// when the TERM or KILL attempt actually reached at least one remaining
+/// member of the recorded process group; a group that had already settled
+/// reports `AlreadyExited`, even when it disappeared between the request and
+/// the signal. The retained command exit result is reported alongside and is
+/// never relabeled by this verdict.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelOutcome {
+    AlreadyExited,
+    CancelWon,
+}
+
 impl ExitResult {
     #[cfg(unix)]
     pub fn from_status(status: std::process::ExitStatus) -> Self {
