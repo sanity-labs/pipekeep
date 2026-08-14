@@ -34,6 +34,117 @@ fn outer_command(runtime: &Path, id: &str, shell: &str) -> Command {
 }
 
 #[test]
+fn remote_protocol_exposes_raw_standard_streams() {
+    let runtime = runtime_dir("raw-protocol");
+    let binary = binary();
+    let input = b"line one\n\0line two";
+    let mut child = Command::new(&binary)
+        .env("PIPEKEEP_RUNTIME_DIR", runtime.path())
+        .env("PIPEKEEP_SESSION_TTL_SECS", "2")
+        .args(["--id", "raw-protocol", "--", "/bin/sh", "-c"])
+        .arg("cat; printf raw-error >&2; exit 9")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let request = serde_json::json!({"stdin_eof": input.len()});
+    let mut wire_input = serde_json::to_vec(&request).unwrap();
+    wire_input.push(b'\n');
+    wire_input.extend_from_slice(input);
+    child.stdin.take().unwrap().write_all(&wire_input).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(9));
+    let header_end = output
+        .stdout
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap();
+    let header: serde_json::Value = serde_json::from_slice(&output.stdout[..header_end]).unwrap();
+    assert_eq!(header["offsets"]["stdin"], 0);
+    assert_eq!(&output.stdout[header_end + 1..], input);
+    assert_eq!(output.stderr, b"raw-error");
+}
+
+#[test]
+fn stdin_eof_control_is_sticky_and_idempotent() {
+    let runtime = runtime_dir("stdin-eof-control");
+    let binary = binary();
+    let mut attachment = Command::new(&binary)
+        .env("PIPEKEEP_RUNTIME_DIR", runtime.path())
+        .env("PIPEKEEP_SESSION_TTL_SECS", "2")
+        .args([
+            "--id",
+            "stdin-eof-control",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat; printf done",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut attachment_input = attachment.stdin.take().unwrap();
+    let mut attachment_output = attachment.stdout.take().unwrap();
+    attachment_input.write_all(b"{}\nabc").unwrap();
+    attachment_input.flush().unwrap();
+
+    let mut response = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        attachment_output.read_exact(&mut byte).unwrap();
+        if byte[0] == b'\n' {
+            break;
+        }
+        response.push(byte[0]);
+    }
+    let header: serde_json::Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(header["offsets"]["stdin"], 0);
+
+    for attempt in 0..2 {
+        let mut control = Command::new(&binary)
+            .env("PIPEKEEP_RUNTIME_DIR", runtime.path())
+            .args([
+                "--id",
+                "stdin-eof-control",
+                "--",
+                "/bin/sh",
+                "-c",
+                "exit 99",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let request = serde_json::json!({"action":"stdin-eof", "stdin_eof":3});
+        let mut request = serde_json::to_vec(&request).unwrap();
+        request.push(b'\n');
+        control.stdin.take().unwrap().write_all(&request).unwrap();
+        let output = control.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "control attempt {attempt}, status: {}, stdout: {}, stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["stdin_eof_at"], 3);
+    }
+
+    let mut raw_output = Vec::new();
+    attachment_output.read_to_end(&mut raw_output).unwrap();
+    let status = attachment.wait().unwrap();
+    drop(attachment_input);
+    assert!(status.success());
+    assert_eq!(raw_output, b"abcdone");
+}
+
+#[test]
 fn carries_stdin_stdout_stderr_and_exit_status() {
     let runtime = runtime_dir("streams");
     let mut child = outer_command(
@@ -73,7 +184,7 @@ fn reconnects_after_transport_process_is_killed() {
         &script,
         format!(
             r#"#!/bin/sh
-if mkdir '{}'; then
+if mkdir '{}' 2>/dev/null; then
   '{}' --id resume -- /bin/sh -c 'printf first; sleep 1; printf second' &
   child=$!
   (sleep 0.2; kill "$child" 2>/dev/null) &

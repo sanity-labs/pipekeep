@@ -18,10 +18,22 @@ pub struct AllOffsets {
     pub stderr: u64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientAction {
+    StdinEof,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct ClientHello {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ClientAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offsets: Option<OutputOffsets>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stdin_start: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin_eof: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -29,6 +41,14 @@ pub struct ServerHello {
     pub offsets: AllOffsets,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub nobuffer: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stdin_eof: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_eof: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_eof: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<ExitResult>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -52,6 +72,10 @@ impl ExitResult {
     pub fn process_code(&self) -> i32 {
         self.code.unwrap_or_else(|| 128 + self.signal.unwrap_or(1))
     }
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug)]

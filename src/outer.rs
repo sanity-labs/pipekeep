@@ -1,6 +1,5 @@
 use crate::protocol::{
-    read_frame, read_line, write_frame, write_json_line, ClientHello, Frame, OutputOffsets,
-    ServerHello,
+    read_line, write_json_line, ClientAction, ClientHello, OutputOffsets, ServerHello,
 };
 use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
@@ -8,9 +7,10 @@ use std::fs::File;
 use std::io::Write as _;
 use std::os::unix::fs::FileExt;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify};
 
@@ -52,6 +52,10 @@ pub async fn run(command: Vec<String>, nobuffer: bool) -> Result<i32> {
                 backoff = (backoff * 2).min(Duration::from_secs(5));
             }
             AttemptResult::ServerError(error) => {
+                if error.contains("session already has an attached client") {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
                 if !create && !established && error.contains("session does not exist") {
                     create = true;
                     continue;
@@ -68,6 +72,10 @@ enum AttemptResult {
     ServerError(String),
 }
 
+enum SendOutcome {
+    Reattach,
+}
+
 async fn attempt(
     command: &[String],
     input: Arc<InputBuffer>,
@@ -75,6 +83,7 @@ async fn attempt(
     delivered: &mut OutputOffsets,
     create: bool,
 ) -> Result<AttemptResult> {
+    let input_state = input.attachment_state().await;
     let mut process = Command::new(&command[0]);
     process
         .args(&command[1..])
@@ -88,22 +97,20 @@ async fn attempt(
     let mut transport_input = child.stdin.take().context("transport has no stdin")?;
     let mut transport_output = child.stdout.take().context("transport has no stdout")?;
     let transport_error = child.stderr.take().context("transport has no stderr")?;
-    let diagnostic_sinks = sinks.clone();
-    let diagnostics =
-        tokio::spawn(async move { forward_diagnostics(transport_error, diagnostic_sinks).await });
 
     let hello = ClientHello {
+        action: None,
         offsets: if create { None } else { Some(*delivered) },
+        stdin_start: input_state.start,
+        stdin_eof: input_state.eof,
     };
     if write_json_line(&mut transport_input, &hello).await.is_err() {
-        diagnostics.abort();
         finish_transport(&mut child).await;
         return Ok(AttemptResult::Disconnected { opened: false });
     }
     let line = match read_line(&mut transport_output).await {
         Ok(Some(line)) => line,
         Ok(None) | Err(_) => {
-            diagnostics.abort();
             finish_transport(&mut child).await;
             return Ok(AttemptResult::Disconnected { opened: false });
         }
@@ -111,7 +118,6 @@ async fn attempt(
     let value: serde_json::Value = serde_json::from_slice(&line)
         .context("transport returned an invalid opening JSON message")?;
     if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-        diagnostics.abort();
         finish_transport(&mut child).await;
         return Ok(AttemptResult::ServerError(error.to_owned()));
     }
@@ -128,65 +134,193 @@ async fn attempt(
     delivered.stdout = server.offsets.stdout;
     delivered.stderr = server.offsets.stderr;
 
-    let sender_input = input.clone();
-    let mut sender = tokio::spawn(async move {
-        send_stdin(&mut transport_input, sender_input, server.offsets.stdin).await
+    let stdout_position = Arc::new(AtomicU64::new(delivered.stdout));
+    let stderr_position = Arc::new(AtomicU64::new(delivered.stderr));
+    let stdout_sink = sinks.clone();
+    let stdout_counter = stdout_position.clone();
+    let mut stdout_task = tokio::spawn(async move {
+        copy_raw_output(transport_output, &stdout_sink.stdout, stdout_counter).await
+    });
+    let stderr_sink = sinks.clone();
+    let stderr_counter = stderr_position.clone();
+    let mut stderr_task = tokio::spawn(async move {
+        copy_raw_output(transport_error, &stderr_sink.stderr, stderr_counter).await
     });
 
-    loop {
-        tokio::select! {
-            frame = read_frame(&mut transport_output) => {
-                match frame {
-                    Ok(Some(Frame::StdoutData { offset, data })) => {
-                        deliver_output(
-                            &sinks.stdout,
-                            &mut delivered.stdout,
-                            offset,
-                            &data,
-                            server.nobuffer,
-                        ).await?;
-                    }
-                    Ok(Some(Frame::StderrData { offset, data })) => {
-                        deliver_output(
-                            &sinks.stderr,
-                            &mut delivered.stderr,
-                            offset,
-                            &data,
-                            server.nobuffer,
-                        ).await?;
-                    }
-                    Ok(Some(Frame::StdinPosition { .. })) => {
-                        // The next attachment uses the broker's authoritative
-                        // opening position. In-process acknowledgements are
-                        // intentionally only a retention hint.
-                    }
-                    Ok(Some(Frame::Exit(result))) => {
-                        sender.abort();
-                        diagnostics.abort();
-                        finish_transport(&mut child).await;
-                        return Ok(AttemptResult::Exited(result.process_code()));
-                    }
-                    Ok(Some(_)) => bail!("server sent a client-to-server frame"),
-                    Ok(None) | Err(_) => {
-                        sender.abort();
-                        diagnostics.abort();
-                        finish_transport(&mut child).await;
-                        return Ok(AttemptResult::Disconnected { opened: true });
-                    }
+    let sender_input = input.clone();
+    let stdin_position = server.offsets.stdin;
+    let declared_eof = hello.stdin_eof;
+    let server_stdin_eof = server.stdin_eof;
+    let (eof_tx, mut eof_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut sender = tokio::spawn(async move {
+        send_raw_stdin(
+            &mut transport_input,
+            sender_input,
+            stdin_position,
+            declared_eof,
+            server_stdin_eof,
+            eof_tx,
+        )
+        .await
+    });
+
+    enum Stop {
+        Child(std::io::Result<std::process::ExitStatus>),
+        Sender(std::result::Result<Result<SendOutcome>, tokio::task::JoinError>),
+        Stdout(std::result::Result<Result<()>, tokio::task::JoinError>),
+        Stderr(std::result::Result<Result<()>, tokio::task::JoinError>),
+    }
+
+    let (stop, mut stdout_done, mut stderr_done) = loop {
+        let stop = tokio::select! {
+            result = child.wait() => Stop::Child(result),
+            result = &mut sender => Stop::Sender(result),
+            result = &mut stdout_task => Stop::Stdout(result),
+            result = &mut stderr_task => Stop::Stderr(result),
+            Some(offset) = eof_rx.recv() => {
+                if declare_remote_stdin_eof(command, offset, sinks.clone())
+                    .await
+                    .is_err()
+                {
+                    break (Stop::Sender(Ok(Ok(SendOutcome::Reattach))), false, false);
                 }
+                continue;
             }
-            result = &mut sender => {
-                diagnostics.abort();
-                finish_transport(&mut child).await;
-                match result {
-                    Ok(Ok(())) => unreachable!("stdin sender remains open after EOF"),
-                    Ok(Err(_)) | Err(_) => {
-                        return Ok(AttemptResult::Disconnected { opened: true });
-                    }
-                }
+        };
+        match stop {
+            Stop::Stdout(result) => break (Stop::Stdout(result), true, false),
+            Stop::Stderr(result) => break (Stop::Stderr(result), false, true),
+            other => break (other, false, false),
+        }
+    };
+
+    let mut fatal = None;
+    match stop {
+        Stop::Child(result) => {
+            if let Err(error) = result {
+                fatal = Some(error.into());
             }
         }
+        Stop::Sender(result) => match result {
+            Ok(Ok(SendOutcome::Reattach)) | Ok(Err(_)) | Err(_) => {
+                finish_transport(&mut child).await;
+            }
+        },
+        Stop::Stdout(result) => match flatten_task(result) {
+            Ok(()) => {
+                let _ = child.wait().await;
+            }
+            Err(error) => {
+                fatal = Some(error);
+                finish_transport(&mut child).await;
+            }
+        },
+        Stop::Stderr(result) => match flatten_task(result) {
+            Ok(()) => {
+                let _ = child.wait().await;
+            }
+            Err(error) => {
+                fatal = Some(error);
+                finish_transport(&mut child).await;
+            }
+        },
     }
+    sender.abort();
+
+    if !stdout_done {
+        match flatten_task(stdout_task.await) {
+            Ok(()) => {}
+            Err(error) if fatal.is_none() => fatal = Some(error),
+            Err(_) => {}
+        }
+        stdout_done = true;
+    }
+    if !stderr_done {
+        match flatten_task(stderr_task.await) {
+            Ok(()) => {}
+            Err(error) if fatal.is_none() => fatal = Some(error),
+            Err(_) => {}
+        }
+        stderr_done = true;
+    }
+    let _ = (stdout_done, stderr_done);
+
+    delivered.stdout = stdout_position.load(Ordering::Acquire);
+    delivered.stderr = stderr_position.load(Ordering::Acquire);
+    if let Some(error) = fatal {
+        return Err(error);
+    }
+
+    if let Some(exit) = server.exit {
+        let stdout_complete = server.stdout_eof.is_some_and(|end| delivered.stdout >= end);
+        let stderr_complete = server.stderr_eof.is_some_and(|end| delivered.stderr >= end);
+        if stdout_complete && stderr_complete {
+            return Ok(AttemptResult::Exited(exit.process_code()));
+        }
+    }
+    Ok(AttemptResult::Disconnected { opened: true })
+}
+
+fn flatten_task(result: std::result::Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
+    result.context("stream forwarding task failed")?
+}
+
+async fn declare_remote_stdin_eof(
+    command: &[String],
+    offset: u64,
+    sinks: Arc<Sinks>,
+) -> Result<()> {
+    let mut process = Command::new(&command[0]);
+    process
+        .args(&command[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = process
+        .spawn()
+        .with_context(|| format!("cannot start EOF control command {:?}", command[0]))?;
+    let mut input = child.stdin.take().context("EOF control has no stdin")?;
+    let mut output = child.stdout.take().context("EOF control has no stdout")?;
+    let error = child.stderr.take().context("EOF control has no stderr")?;
+    let diagnostic_sinks = sinks.clone();
+    let diagnostics =
+        tokio::spawn(async move { forward_untracked_stderr(error, diagnostic_sinks).await });
+    write_json_line(
+        &mut input,
+        &ClientHello {
+            action: Some(ClientAction::StdinEof),
+            offsets: None,
+            stdin_start: 0,
+            stdin_eof: Some(offset),
+        },
+    )
+    .await?;
+    input.shutdown().await?;
+    let response = read_line(&mut output)
+        .await?
+        .context("EOF control ended before its response")?;
+    let value: serde_json::Value = serde_json::from_slice(&response)?;
+    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+        finish_transport(&mut child).await;
+        diagnostics.abort();
+        bail!("remote stdin EOF: {error}");
+    }
+    if value
+        .get("stdin_eof_at")
+        .and_then(serde_json::Value::as_u64)
+        != Some(offset)
+    {
+        finish_transport(&mut child).await;
+        diagnostics.abort();
+        bail!("remote stdin EOF response did not confirm byte {offset}");
+    }
+    let status = child.wait().await?;
+    diagnostics.await.context("EOF diagnostics task failed")??;
+    if !status.success() {
+        bail!("stdin EOF control transport exited with {status}");
+    }
+    Ok(())
 }
 
 async fn finish_transport(child: &mut Child) {
@@ -204,7 +338,29 @@ struct Sinks {
     stderr: Mutex<tokio::io::Stderr>,
 }
 
-async fn forward_diagnostics<R: tokio::io::AsyncRead + Unpin>(
+async fn copy_raw_output<R, W>(
+    mut reader: R,
+    sink: &Mutex<W>,
+    position: Arc<AtomicU64>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0_u8; CHUNK_SIZE];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        let mut writer = sink.lock().await;
+        writer.write_all(&buffer[..count]).await?;
+        writer.flush().await?;
+        position.fetch_add(count as u64, Ordering::Release);
+    }
+}
+
+async fn forward_untracked_stderr<R: AsyncRead + Unpin>(
     mut reader: R,
     sinks: Arc<Sinks>,
 ) -> Result<()> {
@@ -220,29 +376,10 @@ async fn forward_diagnostics<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-async fn deliver_output<W: tokio::io::AsyncWrite + Unpin>(
-    sink: &Mutex<W>,
-    position: &mut u64,
-    offset: u64,
-    data: &[u8],
-    gaps_allowed: bool,
-) -> Result<()> {
-    if offset > *position {
-        if !gaps_allowed {
-            bail!("buffered output contains a gap at byte {position}");
-        }
-        *position = offset;
-    }
-    let skip = position.saturating_sub(offset) as usize;
-    if skip >= data.len() {
-        return Ok(());
-    }
-    let bytes = &data[skip..];
-    let mut writer = sink.lock().await;
-    writer.write_all(bytes).await?;
-    writer.flush().await?;
-    *position += bytes.len() as u64;
-    Ok(())
+#[derive(Clone, Copy)]
+struct InputState {
+    start: u64,
+    eof: Option<u64>,
 }
 
 #[derive(Default)]
@@ -278,6 +415,18 @@ impl InputBuffer {
             read_local_stdin(task_input, writer).await;
         });
         Ok(input)
+    }
+
+    async fn attachment_state(&self) -> InputState {
+        let meta = self.meta.lock().await;
+        InputState {
+            start: if self.file.is_some() {
+                0
+            } else {
+                meta.live_base
+            },
+            eof: meta.eof.then_some(meta.end),
+        }
     }
 
     async fn next(&self, position: u64) -> Result<InputPart> {
@@ -350,30 +499,47 @@ async fn read_local_stdin(input: Arc<InputBuffer>, mut file: Option<File>) {
     }
 }
 
-async fn send_stdin<W: tokio::io::AsyncWrite + Unpin>(
+async fn send_raw_stdin<W: AsyncWrite + Unpin>(
     writer: &mut W,
     input: Arc<InputBuffer>,
     mut position: u64,
-) -> Result<()> {
+    declared_eof: Option<u64>,
+    server_eof: bool,
+    eof: tokio::sync::mpsc::UnboundedSender<u64>,
+) -> Result<SendOutcome> {
+    if server_eof {
+        return std::future::pending::<Result<SendOutcome>>().await;
+    }
     loop {
         let notified = input.changed.notified();
         match input.next(position).await? {
             InputPart::Data { offset, data } => {
-                write_frame(
-                    writer,
-                    &Frame::StdinData {
-                        offset,
-                        data: data.clone(),
-                    },
-                )
-                .await?;
-                position = offset + data.len() as u64;
+                if offset != position {
+                    return Ok(SendOutcome::Reattach);
+                }
+                writer.write_all(&data).await?;
+                writer.flush().await?;
+                position += data.len() as u64;
             }
             InputPart::Eof { offset } => {
-                write_frame(writer, &Frame::StdinEof { offset }).await?;
-                // Transport EOF is deliberately not child stdin EOF. Keep the
-                // transport pipe open until the exit frame arrives.
-                std::future::pending::<()>().await;
+                if offset != position {
+                    bail!("server stdin position is beyond local EOF");
+                }
+                if let Some(declared) = declared_eof {
+                    if declared != offset {
+                        bail!("declared stdin EOF changed during attachment");
+                    }
+                    return std::future::pending::<Result<SendOutcome>>().await;
+                }
+                eof.send(offset)
+                    .map_err(|_| anyhow::anyhow!("stdin EOF controller stopped"))?;
+                // Keep both the transport input and the notification channel
+                // alive. Closing the transport's stdin would detach the
+                // remote data proxy before its stdout and stderr are drained.
+                let keep_eof_channel = eof;
+                let result = std::future::pending::<Result<SendOutcome>>().await;
+                drop(keep_eof_channel);
+                return result;
             }
             InputPart::Wait => notified.await,
         }

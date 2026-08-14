@@ -49,23 +49,31 @@ and the broker spools stdout/stderr in its private session directory. With
 the resulting gaps. Apply `--nobuffer` to both the outer and inner invocation
 when input should also use discard semantics.
 
-## Wire format
+## Attachment protocol
 
-The opening request and response are newline-terminated JSON, as described in
-[design.md](design.md). Binary frames then use this fixed header:
+Each attachment starts with one newline-terminated JSON request on stdin and
+one newline-terminated JSON response on stdout. Everything after the response
+is transported as ordinary raw stdin, stdout, and stderr. SSH and Kubernetes
+Exec preserve those streams; no data framing is exposed to clients.
 
-```text
-+------------+----------------------+-------------------+
-| type: u8   | payload length: u32  | payload           |
-|            | network byte order   | length bytes      |
-+------------+----------------------+-------------------+
+On reconnect, the client reports the next stdout and stderr bytes it wants:
+
+```json
+{"offsets":{"stdout":12312,"stderr":131}}
 ```
 
-Data payloads start with an absolute `u64` network-byte-order offset. Frame
-types are stdin data (`1`), stdin EOF (`2`), stdout data (`3`), stderr data
-(`4`), stdin position (`5`), and exit result (`6`). The exit payload is JSON
-containing either `code` or `signal`. Unknown fields in opening JSON messages
-are ignored.
+The response reports the next stdin byte the broker needs and the actual output
+positions it can provide:
+
+```json
+{"offsets":{"stdin":942,"stdout":12312,"stderr":131}}
+```
+
+EOF and exit status are sticky broker state. A request's numeric `stdin_eof`
+is the absolute input end; `stdin_eof: true` in a response confirms that the
+broker has reached it. Response values `stdout_eof` and `stderr_eof` are the
+absolute output ends. A retained `exit` contains either `code` or `signal`.
+See [design.md](design.md) for the complete reconnection rules.
 
 ## Runtime tuning
 
@@ -73,5 +81,5 @@ are ignored.
 - `PIPEKEEP_SESSION_TTL_SECS`: completed-session replay lifetime (default `300`).
 
 Replay buffers are process-lifetime aids, not durable storage. A broker keeps
-completed output for the TTL so an exit-frame transport failure can still be
-resumed.
+completed output and exit state for the TTL so a final transport failure can
+still be resumed.

@@ -115,8 +115,10 @@ requested command. The broker owns the child's three pipes and survives the
 loss of the particular Kubernetes Exec or SSH process that created it. Later
 invocations with the same ID connect to that broker.
 
-A session has at most one attached protocol client. A second attachment is
-rejected. This avoids ambiguous stdin ownership and output-consumption rules.
+A session has at most one attached data client. A second data attachment is
+rejected, although idempotent control requests such as an EOF declaration may
+run alongside it. This avoids ambiguous stdin ownership and
+output-consumption rules.
 
 The broker records absolute byte positions for all three streams. Position
 `N` means that `N` bytes precede the next byte. Positions begin at zero and
@@ -142,46 +144,84 @@ stdout and stderr positions it wants:
 {"offsets":{"stdout":12312,"stderr":131}}
 ```
 
-The server replies with one newline-terminated JSON object before any binary
-frames:
+The server replies with one newline-terminated JSON object before any command
+output:
 
 ```json
 {"offsets":{"stdin":942,"stdout":12312,"stderr":131}}
 ```
 
 The returned stdin position is authoritative: it is the first stdin byte the
-server still needs. The outer `pipekeep` retransmits from that point. The returned
-stdout and stderr positions are the first bytes the server can actually
+server still needs. The client sends raw stdin beginning at that position. The
+returned stdout and stderr positions are the first raw bytes the server will
 provide. They may be greater than requested when data was not retained.
+
+A client that has already observed local stdin EOF includes its absolute end:
+
+```json
+{"offsets":{"stdout":12312,"stderr":131},"stdin_eof":2048}
+```
+
+If stdin EOF is discovered during an attachment, the client makes a separate
+short invocation with an EOF declaration while leaving the data attachment
+open:
+
+```json
+{"action":"stdin-eof","stdin_eof":2048}
+```
+
+The broker retains this declaration. It closes command stdin after accepting
+byte 2047, even if the EOF declaration's transport disappears, and repeated
+declarations of EOF at 2048 are harmless. `stdin_start` may identify the first
+input byte a no-buffer client still retains; it is zero and omitted for a
+buffered client.
+
+The response can also report sticky stream and process state:
+
+```json
+{
+  "offsets":{"stdin":2048,"stdout":12312,"stderr":131},
+  "stdin_eof":true,
+  "stdout_eof":14000,
+  "stderr_eof":131,
+  "exit":{"code":0}
+}
+```
+
+An output EOF value is that stream's absolute end. `exit` is reported only
+after the command has terminated and both output streams have closed. A client
+can therefore replay through the advertised ends and return the retained exit
+status without trusting the status of the particular transport invocation.
 
 Unknown JSON fields are ignored. A future incompatible protocol can add an
 explicit version field and reject versions it cannot understand.
 
-## Framed stream protocol
+## Raw stream transport
 
-After the JSON exchange, the connection switches to binary frames. Framing is
-necessary because acknowledgements, EOF, exit status, stdout, and stderr must
-share a transport without contaminating the user's streams.
+After the JSON exchange, the client and remote `pipekeep` use the transport's
+ordinary streams directly:
 
-Each frame contains a type, a payload length, and a payload. Data frames also
-carry the absolute offset of their first byte.
-
-| Direction | Frame | Meaning |
+| Direction | Transport stream | Meaning |
 | --- | --- | --- |
-| client to server | stdin data | Input bytes and their absolute starting offset |
-| client to server | stdin EOF | Intentional EOF and the final stdin offset |
-| server to client | stdout data | Output bytes and their absolute starting offset |
-| server to client | stderr data | Error bytes and their absolute starting offset |
-| server to client | stdin position | Next stdin byte still needed by the server |
-| server to client | exit | Command exit status |
+| client to server | stdin | Command input beginning at the returned stdin offset |
+| server to client | stdout | Command stdout beginning at the returned stdout offset |
+| server to client | stderr | Command stderr beginning at the returned stderr offset |
 
-Transport EOF is never interpreted as child stdin EOF: it means only that the
-attachment was lost. Child stdin closes only after an explicit stdin EOF frame.
+SSH and Kubernetes Exec already transport and reconstruct these three streams.
+The short-lived remote `pipekeep` translates between them and the detached
+broker's private local protocol. A public protocol client does not parse data
+frames: it copies bytes and advances one counter after each successful local
+pipe write.
 
-Offsets make retries idempotent at the pipe boundary. The server discards an
-overlapping stdin prefix it has already accepted. The client discards
-overlapping stdout or stderr it has already delivered. A forward jump denotes
-a gap rather than silently renumbering the stream.
+Transport closure is never interpreted as command stdin EOF: it means only
+that the attachment was lost. Input EOF is the sticky absolute position
+declared in a header. Output EOF and exit status are likewise retained broker
+state and are reported again on later attachments.
+
+Offsets make retries idempotent at the pipe boundary. The server tells the
+client where to restart stdin, while the client tells the server where to
+restart stdout and stderr. A forward jump in an opening response denotes a gap
+rather than silently renumbering a stream.
 
 ## Buffering and gaps
 
@@ -212,9 +252,10 @@ Kubernetes-specific behavior in the protocol. An API client:
 1. opens an Exec request with stdin, stdout, and stderr enabled and TTY disabled;
 2. invokes `pipekeep --id ID -- COMMAND ...` in the container;
 3. sends the JSON handshake on stdin;
-4. parses the JSON response and subsequent frames;
-5. records the next delivered stdout and stderr offsets; and
-6. opens a new Exec request with those offsets after disconnection.
+4. parses the JSON response on stdout;
+5. copies raw stdin, stdout, and stderr while counting delivered bytes;
+6. declares stdin EOF by its absolute position when needed; and
+7. opens a new Exec request with the output offsets after disconnection.
 
 The command line is identical on every attempt. Only the opening JSON object
 changes. The ordinary `kubectl` case uses the outer `pipekeep` to perform these

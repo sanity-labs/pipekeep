@@ -28,6 +28,14 @@ enum Request {
     Attach {
         #[serde(default)]
         offsets: OutputOffsets,
+        #[serde(default)]
+        stdin_start: u64,
+        #[serde(default)]
+        stdin_eof: Option<u64>,
+    },
+    #[serde(rename = "stdin-eof")]
+    StdinEof {
+        offset: u64,
     },
     Pid,
     Cancel,
@@ -43,6 +51,7 @@ struct OutputChunk {
 struct Meta {
     stdin_position: u64,
     stdin_eof: bool,
+    stdin_eof_at: Option<u64>,
     stdout_end: u64,
     stderr_end: u64,
     stdout_closed: bool,
@@ -234,7 +243,9 @@ async fn drain_output<R: AsyncRead + Unpin>(mut reader: R, stream: Stream, share
             }
             Ok(count) => {
                 let data = buffer[..count].to_vec();
-                if !shared.nobuffer && file.write_all(&data).await.is_err() {
+                if !shared.nobuffer
+                    && (file.write_all(&data).await.is_err() || file.flush().await.is_err())
+                {
                     return;
                 }
                 let mut meta = shared.meta.lock().await;
@@ -281,7 +292,26 @@ async fn handle_connection(mut stream: UnixStream, shared: Arc<Shared>) -> Resul
             Ok(result) => write_json_line(&mut stream, &serde_json::json!({"exit": result})).await,
             Err(error) => write_error_line(&mut stream, &error.to_string()).await,
         },
-        Request::Attach { offsets } => attach(stream, shared, offsets).await,
+        Request::Attach {
+            offsets,
+            stdin_start,
+            stdin_eof,
+        } => attach(stream, shared, offsets, stdin_start, stdin_eof).await,
+        Request::StdinEof { offset } => match declare_stdin_eof(&shared, offset).await {
+            Ok(()) => {
+                let meta = shared.meta.lock().await;
+                write_json_line(
+                    &mut stream,
+                    &serde_json::json!({
+                        "stdin": meta.stdin_position,
+                        "stdin_eof": meta.stdin_eof,
+                        "stdin_eof_at": meta.stdin_eof_at,
+                    }),
+                )
+                .await
+            }
+            Err(error) => write_error_line(&mut stream, &error.to_string()).await,
+        },
     }
 }
 
@@ -301,7 +331,13 @@ impl Drop for ConnectionGuard {
     }
 }
 
-async fn attach(mut stream: UnixStream, shared: Arc<Shared>, offsets: OutputOffsets) -> Result<()> {
+async fn attach(
+    mut stream: UnixStream,
+    shared: Arc<Shared>,
+    offsets: OutputOffsets,
+    stdin_start: u64,
+    stdin_eof: Option<u64>,
+) -> Result<()> {
     if shared
         .attached
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -316,6 +352,44 @@ async fn attach(mut stream: UnixStream, shared: Arc<Shared>, offsets: OutputOffs
     // the returned offset and the receiver subscription.
     let stdout_live = shared.stdout_live.subscribe();
     let stderr_live = shared.stderr_live.subscribe();
+    let mut meta = shared.meta.lock().await;
+    if stdin_start > meta.stdin_position {
+        if meta.stdin_eof {
+            drop(meta);
+            write_error_line(&mut stream, "stdin start is beyond the recorded EOF").await?;
+            return Ok(());
+        }
+        if !shared.nobuffer {
+            let position = meta.stdin_position;
+            drop(meta);
+            write_error_line(
+                &mut stream,
+                &format!("buffered stdin contains a gap at byte {position}"),
+            )
+            .await?;
+            return Ok(());
+        }
+        if meta.stdin_eof_at.is_some_and(|eof| stdin_start > eof) {
+            drop(meta);
+            write_error_line(&mut stream, "stdin start is beyond the declared EOF").await?;
+            return Ok(());
+        }
+        meta.stdin_position = stdin_start;
+    }
+    let known_stdin_eof = meta.stdin_eof_at;
+    drop(meta);
+
+    // Advancing the live-input start can itself reach a previously declared
+    // EOF. Reapplying the sticky declaration closes the command's stdin in
+    // that case; declaring the same absolute offset is intentionally
+    // idempotent.
+    if let Some(offset) = stdin_eof.or(known_stdin_eof) {
+        if let Err(error) = declare_stdin_eof(&shared, offset).await {
+            write_error_line(&mut stream, &error.to_string()).await?;
+            return Ok(());
+        }
+    }
+
     let meta = shared.meta.lock().await;
     if offsets.stdout > meta.stdout_end || offsets.stderr > meta.stderr_end {
         drop(meta);
@@ -343,6 +417,13 @@ async fn attach(mut stream: UnixStream, shared: Arc<Shared>, offsets: OutputOffs
             stderr,
         },
         nobuffer: shared.nobuffer,
+        stdin_eof: meta.stdin_eof,
+        stdout_eof: meta.stdout_closed.then_some(meta.stdout_end),
+        stderr_eof: meta.stderr_closed.then_some(meta.stderr_end),
+        exit: meta
+            .status
+            .clone()
+            .filter(|_| meta.stdout_closed && meta.stderr_closed),
     };
     drop(meta);
     write_json_line(&mut stream, &hello).await?;
@@ -402,23 +483,63 @@ async fn receive_input<R: AsyncRead + Unpin>(
     Ok(())
 }
 
+async fn declare_stdin_eof(shared: &Shared, offset: u64) -> Result<()> {
+    // child_stdin is also the serialization lock for accepted input and EOF
+    // declarations. Always take it before meta when both are needed.
+    let mut stdin = shared.child_stdin.lock().await;
+    let should_close = {
+        let mut meta = shared.meta.lock().await;
+        if offset < meta.stdin_position {
+            bail!(
+                "stdin EOF at byte {offset} is behind accepted byte {}",
+                meta.stdin_position
+            );
+        }
+        if let Some(existing) = meta.stdin_eof_at {
+            if existing != offset {
+                bail!("stdin EOF was already declared at byte {existing}");
+            }
+        } else {
+            meta.stdin_eof_at = Some(offset);
+        }
+        if offset == meta.stdin_position {
+            meta.stdin_eof = true;
+            true
+        } else {
+            false
+        }
+    };
+    if should_close {
+        stdin.take();
+        shared.changed.notify_waiters();
+    }
+    Ok(())
+}
+
 async fn accept_stdin(
     shared: &Shared,
     offset: u64,
     data: &[u8],
     acknowledgements: &mpsc::UnboundedSender<u64>,
 ) -> Result<()> {
-    let position = shared.meta.lock().await.stdin_position;
-    if shared.meta.lock().await.stdin_eof {
-        bail!("stdin data arrived after EOF");
-    }
+    // Serialize the position check and write with EOF declarations.
+    let mut stdin_guard = shared.child_stdin.lock().await;
+    let (position, eof_at) = {
+        let meta = shared.meta.lock().await;
+        if meta.stdin_eof {
+            bail!("stdin data arrived after EOF");
+        }
+        (meta.stdin_position, meta.stdin_eof_at)
+    };
     if offset > position && !shared.nobuffer {
         bail!("stdin contains a gap at offset {position}");
     }
     let mut start = position.saturating_sub(offset) as usize;
     start = start.min(data.len());
     let mut logical_position = position.max(offset);
-    let mut stdin_guard = shared.child_stdin.lock().await;
+    if eof_at.is_some_and(|eof| logical_position + (data.len() - start) as u64 > eof) {
+        bail!("stdin data extends beyond its declared EOF");
+    }
     let Some(stdin) = stdin_guard.as_mut() else {
         return Ok(());
     };
@@ -431,8 +552,17 @@ async fn accept_stdin(
         logical_position += count as u64;
         let mut meta = shared.meta.lock().await;
         meta.stdin_position = logical_position;
+        let reached_eof = meta.stdin_eof_at == Some(logical_position);
+        if reached_eof {
+            meta.stdin_eof = true;
+        }
         drop(meta);
         let _ = acknowledgements.send(logical_position);
+        if reached_eof {
+            stdin_guard.take();
+            shared.changed.notify_waiters();
+            break;
+        }
     }
     if start == data.len() && logical_position == position {
         let _ = acknowledgements.send(position);
@@ -450,17 +580,8 @@ async fn accept_stdin_eof(
     offset: u64,
     acknowledgements: &mpsc::UnboundedSender<u64>,
 ) -> Result<()> {
-    let mut meta = shared.meta.lock().await;
-    if offset < meta.stdin_position || (offset > meta.stdin_position && !shared.nobuffer) {
-        bail!("stdin EOF offset does not match the accepted position");
-    }
-    if offset > meta.stdin_position {
-        meta.stdin_position = offset;
-    }
-    meta.stdin_eof = true;
-    let position = meta.stdin_position;
-    drop(meta);
-    shared.child_stdin.lock().await.take();
+    declare_stdin_eof(shared, offset).await?;
+    let position = shared.meta.lock().await.stdin_position;
     let _ = acknowledgements.send(position);
     Ok(())
 }

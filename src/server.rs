@@ -1,5 +1,6 @@
 use crate::protocol::{
-    read_line, write_error_line, write_json_line, ClientHello, ExitResult, OutputOffsets,
+    read_frame, read_line, write_error_line, write_frame, write_json_line, ClientAction,
+    ClientHello, ExitResult, Frame, OutputOffsets, ServerHello,
 };
 use crate::runtime;
 use anyhow::{bail, Context, Result};
@@ -10,7 +11,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use tokio::io::{AsyncWriteExt, Stdin, Stdout};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, Stderr, Stdin, Stdout};
 use tokio::net::UnixStream;
 
 pub async fn run(id: String, command: Vec<String>, nobuffer: bool) -> Result<i32> {
@@ -30,6 +31,17 @@ pub async fn run(id: String, command: Vec<String>, nobuffer: bool) -> Result<i32
             return Ok(1);
         }
     };
+    if matches!(hello.action, Some(ClientAction::StdinEof)) {
+        let Some(offset) = hello.stdin_eof else {
+            write_error_line(&mut output, "stdin-eof requires stdin_eof").await?;
+            return Ok(1);
+        };
+        return stdin_eof_control(&id, offset, output).await;
+    }
+    if hello.stdin_eof.is_some_and(|eof| eof < hello.stdin_start) {
+        write_error_line(&mut output, "stdin_eof is before stdin_start").await?;
+        return Ok(1);
+    }
     let creating = hello.offsets.is_none();
     let offsets = hello.offsets.unwrap_or_default();
     let session_dir = runtime::session_dir(&id)?;
@@ -52,8 +64,16 @@ pub async fn run(id: String, command: Vec<String>, nobuffer: bool) -> Result<i32
         }
     };
 
-    proxy_attachment(input, output, connection, offsets).await?;
-    Ok(0)
+    proxy_attachment(
+        input,
+        output,
+        tokio::io::stderr(),
+        connection,
+        offsets,
+        hello.stdin_start,
+        hello.stdin_eof,
+    )
+    .await
 }
 
 async fn start_broker(
@@ -151,51 +171,189 @@ async fn connect_existing(session_dir: &Path) -> Result<UnixStream> {
 }
 
 async fn proxy_attachment(
-    mut external_input: Stdin,
+    external_input: Stdin,
     mut external_output: Stdout,
+    mut external_error: Stderr,
     mut broker: UnixStream,
     offsets: OutputOffsets,
-) -> Result<()> {
+    stdin_start: u64,
+    stdin_eof: Option<u64>,
+) -> Result<i32> {
     write_json_line(
         &mut broker,
-        &serde_json::json!({"action": "attach", "offsets": offsets}),
+        &serde_json::json!({
+            "action": "attach",
+            "offsets": offsets,
+            "stdin_start": stdin_start,
+            "stdin_eof": stdin_eof,
+        }),
     )
     .await?;
 
     let response = read_line(&mut broker)
         .await?
         .context("broker closed before the opening response")?;
-    external_output.write_all(&response).await?;
-    external_output.write_all(b"\n").await?;
-    external_output.flush().await?;
     if serde_json::from_slice::<ErrorResponse>(&response)
         .ok()
         .and_then(|value| value.error)
         .is_some()
     {
-        return Ok(());
+        external_output.write_all(&response).await?;
+        external_output.write_all(b"\n").await?;
+        external_output.flush().await?;
+        return Ok(1);
     }
+    let hello: ServerHello = serde_json::from_slice(&response)
+        .context("broker returned an invalid attachment header")?;
+    write_json_line(&mut external_output, &hello).await?;
 
+    let stdin_position = hello.offsets.stdin;
+    let stdin_already_eof = hello.stdin_eof;
+    let mut stdout_position = hello.offsets.stdout;
+    let mut stderr_position = hello.offsets.stderr;
     let (mut broker_read, mut broker_write) = broker.into_split();
-    let input = tokio::spawn(async move {
-        let result = tokio::io::copy(&mut external_input, &mut broker_write).await;
+    let mut input = tokio::spawn(async move {
+        let result = forward_raw_stdin(
+            external_input,
+            &mut broker_write,
+            stdin_position,
+            stdin_eof,
+            stdin_already_eof,
+        )
+        .await;
         let _ = broker_write.shutdown().await;
         result
     });
-    let output = tokio::spawn(async move {
-        let result = tokio::io::copy(&mut broker_read, &mut external_output).await;
-        let _ = external_output.flush().await;
-        result
-    });
+    loop {
+        tokio::select! {
+            result = &mut input => {
+                result??;
+                return Ok(0);
+            }
+            frame = read_frame(&mut broker_read) => {
+                match frame? {
+                    Some(Frame::StdoutData { offset, data }) => {
+                        write_raw_output(
+                            &mut external_output,
+                            &mut stdout_position,
+                            offset,
+                            &data,
+                        ).await?;
+                    }
+                    Some(Frame::StderrData { offset, data }) => {
+                        write_raw_output(
+                            &mut external_error,
+                            &mut stderr_position,
+                            offset,
+                            &data,
+                        ).await?;
+                    }
+                    Some(Frame::StdinPosition { .. }) => {}
+                    Some(Frame::Exit(result)) => {
+                        input.abort();
+                        external_output.flush().await?;
+                        external_error.flush().await?;
+                        return Ok(result.process_code());
+                    }
+                    Some(_) => bail!("broker sent a client-to-server frame"),
+                    None => {
+                        input.abort();
+                        return Ok(0);
+                    }
+                }
+            }
+        }
+    }
+}
 
-    // Broker closure commonly makes the input copy see EPIPE just before the
-    // final output/exit bytes are drained. Output owns attachment completion;
-    // input errors merely describe the same disconnect and must not truncate
-    // those final bytes or leak into the command's stderr.
-    let result = output.await?;
-    input.abort();
-    result?;
+async fn forward_raw_stdin<W: AsyncWrite + Unpin>(
+    mut input: Stdin,
+    broker: &mut W,
+    mut position: u64,
+    eof: Option<u64>,
+    already_eof: bool,
+) -> Result<()> {
+    if already_eof {
+        return std::future::pending::<Result<()>>().await;
+    }
+    if eof.is_some_and(|end| position > end) {
+        bail!("broker stdin position is beyond the declared EOF");
+    }
+    let mut buffer = vec![0_u8; 32 * 1024];
+    loop {
+        if eof == Some(position) {
+            return std::future::pending::<Result<()>>().await;
+        }
+        let limit = eof
+            .map(|end| (end - position) as usize)
+            .unwrap_or(buffer.len())
+            .min(buffer.len());
+        let count = input.read(&mut buffer[..limit]).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        write_frame(
+            broker,
+            &Frame::StdinData {
+                offset: position,
+                data: buffer[..count].to_vec(),
+            },
+        )
+        .await?;
+        position += count as u64;
+    }
+}
+
+async fn write_raw_output<W: AsyncWrite + Unpin>(
+    output: &mut W,
+    position: &mut u64,
+    offset: u64,
+    data: &[u8],
+) -> Result<()> {
+    if offset > *position {
+        bail!("broker output contains a gap at byte {position}");
+    }
+    let skip = position.saturating_sub(offset) as usize;
+    if skip >= data.len() {
+        return Ok(());
+    }
+    output.write_all(&data[skip..]).await?;
+    output.flush().await?;
+    *position += (data.len() - skip) as u64;
     Ok(())
+}
+
+async fn stdin_eof_control(id: &str, offset: u64, mut output: Stdout) -> Result<i32> {
+    let session_dir = runtime::session_dir(id)?;
+    let mut connection = match connect_existing(&session_dir).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            write_error_line(&mut output, &error.to_string()).await?;
+            return Ok(1);
+        }
+    };
+    write_json_line(
+        &mut connection,
+        &serde_json::json!({"action": "stdin-eof", "offset": offset}),
+    )
+    .await?;
+    let response = read_line(&mut connection)
+        .await?
+        .context("broker closed before its stdin EOF response")?;
+    output.write_all(&response).await?;
+    output.write_all(b"\n").await?;
+    output.flush().await?;
+    Ok(
+        if serde_json::from_slice::<ErrorResponse>(&response)
+            .ok()
+            .and_then(|value| value.error)
+            .is_some()
+        {
+            1
+        } else {
+            0
+        },
+    )
 }
 
 #[derive(Deserialize)]
