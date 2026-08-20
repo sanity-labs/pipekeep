@@ -9,6 +9,7 @@ pub enum Mode {
     },
     Server {
         id: String,
+        attachment_id: Option<String>,
         command: Vec<String>,
         nobuffer: bool,
     },
@@ -17,6 +18,10 @@ pub enum Mode {
     },
     Pid {
         id: String,
+    },
+    Detach {
+        id: String,
+        attachment_id: String,
     },
     Broker {
         id: String,
@@ -39,12 +44,14 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
         "--version" | "-V" => return Ok(Mode::Version),
         "cancel" => return parse_control(&args[1..], true),
         "pid" => return parse_control(&args[1..], false),
+        "detach" => return parse_detach(&args[1..]),
         "capabilities" => return parse_capabilities(&args[1..]),
         "__broker" => return parse_broker(&args[1..]),
         _ => {}
     }
 
     let mut id = None;
+    let mut attachment_id = None;
     let mut nobuffer = false;
     let index = 0;
     while index < args.len() {
@@ -55,6 +62,14 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
                     bail!("--id requires a value");
                 };
                 id = Some(value);
+                args.drain(index..=index + 1);
+            }
+            "--attachment-id" => {
+                let value = args.get(index + 1).cloned();
+                let Some(value) = value else {
+                    bail!("--attachment-id requires a value");
+                };
+                attachment_id = Some(value);
                 args.drain(index..=index + 1);
             }
             "--nobuffer" => {
@@ -76,15 +91,43 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
     if let Some(id) = id {
         Ok(Mode::Server {
             id,
+            attachment_id,
             command: args,
             nobuffer,
         })
     } else {
+        if attachment_id.is_some() {
+            bail!("--attachment-id requires --id");
+        }
         Ok(Mode::Outer {
             command: args,
             nobuffer,
         })
     }
+}
+
+fn parse_detach(args: &[String]) -> Result<Mode> {
+    let mut id = None;
+    let mut attachment_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--id" => {
+                id = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--attachment-id" => {
+                attachment_id = args.get(index + 1).cloned();
+                index += 2;
+            }
+            other => bail!("unknown detach option {other:?}"),
+        }
+    }
+    Ok(Mode::Detach {
+        id: id.ok_or_else(|| anyhow::anyhow!("detach requires --id ID"))?,
+        attachment_id: attachment_id
+            .ok_or_else(|| anyhow::anyhow!("detach requires --attachment-id ID"))?,
+    })
 }
 
 fn parse_control(args: &[String], cancel: bool) -> Result<Mode> {
@@ -153,7 +196,8 @@ pub const HELP: &str = r#"pipekeep: resumable process pipes
 
 Usage:
   pipekeep [--nobuffer] [--] TRANSPORT [ARG...]
-  pipekeep --id ID [--nobuffer] -- COMMAND [ARG...]
+  pipekeep --id ID [--attachment-id ATTACHMENT] [--nobuffer] -- COMMAND [ARG...]
+  pipekeep detach --id ID --attachment-id ATTACHMENT
   pipekeep cancel --id ID
   pipekeep pid --id ID
   pipekeep capabilities --json
@@ -178,6 +222,47 @@ mod tests {
             parse(vec!["--id".into(), "x".into(), "--".into(), "cat".into()]).unwrap(),
             Mode::Server { .. }
         ));
+        assert!(matches!(
+            parse(vec![
+                "--id".into(),
+                "x".into(),
+                "--attachment-id".into(),
+                "a".into(),
+                "--".into(),
+                "cat".into()
+            ])
+            .unwrap(),
+            Mode::Server {
+                attachment_id: Some(_),
+                ..
+            }
+        ));
+        assert!(parse(vec![
+            "--attachment-id".into(),
+            "a".into(),
+            "--".into(),
+            "cat".into()
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_detach() {
+        assert!(matches!(
+            parse(vec![
+                "detach".into(),
+                "--id".into(),
+                "x".into(),
+                "--attachment-id".into(),
+                "a".into()
+            ])
+            .unwrap(),
+            Mode::Detach {
+                id,
+                attachment_id
+            } if id == "x" && attachment_id == "a"
+        ));
+        assert!(parse(vec!["detach".into(), "--id".into(), "x".into()]).is_err());
     }
 
     #[test]

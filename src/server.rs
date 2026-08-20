@@ -1,6 +1,7 @@
 use crate::protocol::{
-    read_frame, read_line, write_error_line, write_frame, write_json_line, CancelOutcome,
-    ClientAction, ClientHello, ExitResult, Frame, OutputOffsets, ServerHello,
+    read_frame, read_line, write_error_line, write_frame, write_json_line, write_typed_error_line,
+    CancelOutcome, ClientAction, ClientHello, ExitResult, Frame, OutputOffsets, ServerHello,
+    ERROR_SESSION_MISSING,
 };
 use crate::runtime;
 use anyhow::{bail, Context, Result};
@@ -10,11 +11,17 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, Stderr, Stdin, Stdout};
 use tokio::net::UnixStream;
 
-pub async fn run(id: String, command: Vec<String>, nobuffer: bool) -> Result<i32> {
+pub async fn run(
+    id: String,
+    attachment_id: Option<String>,
+    command: Vec<String>,
+    nobuffer: bool,
+) -> Result<i32> {
     let mut input = tokio::io::stdin();
     let mut output = tokio::io::stdout();
     let line = read_line(&mut input)
@@ -45,6 +52,7 @@ pub async fn run(id: String, command: Vec<String>, nobuffer: bool) -> Result<i32
     let creating = hello.offsets.is_none();
     let offsets = hello.offsets.unwrap_or_default();
     let session_dir = runtime::session_dir(&id)?;
+    let attachment_id = attachment_id.unwrap_or_else(generated_attachment_id);
 
     let connection = if creating {
         match start_broker(&id, &session_dir, &command, nobuffer).await {
@@ -55,6 +63,11 @@ pub async fn run(id: String, command: Vec<String>, nobuffer: bool) -> Result<i32
             }
         }
     } else {
+        if !session_dir.is_dir() {
+            write_typed_error_line(&mut output, "session does not exist", ERROR_SESSION_MISSING)
+                .await?;
+            return Ok(1);
+        }
         match connect_existing(&session_dir).await {
             Ok(connection) => connection,
             Err(error) => {
@@ -69,11 +82,24 @@ pub async fn run(id: String, command: Vec<String>, nobuffer: bool) -> Result<i32
         output,
         tokio::io::stderr(),
         connection,
-        offsets,
-        hello.stdin_start,
-        hello.stdin_eof,
+        AttachmentOpening {
+            offsets,
+            stdin_start: hello.stdin_start,
+            stdin_eof: hello.stdin_eof,
+            attachment_id,
+        },
     )
     .await
+}
+
+fn generated_attachment_id() -> String {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("local-{}-{nanos}-{sequence}", std::process::id())
 }
 
 async fn start_broker(
@@ -170,22 +196,28 @@ async fn connect_existing(session_dir: &Path) -> Result<UnixStream> {
     }
 }
 
+struct AttachmentOpening {
+    offsets: OutputOffsets,
+    stdin_start: u64,
+    stdin_eof: Option<u64>,
+    attachment_id: String,
+}
+
 async fn proxy_attachment(
     external_input: Stdin,
     mut external_output: Stdout,
     external_error: Stderr,
     mut broker: UnixStream,
-    offsets: OutputOffsets,
-    stdin_start: u64,
-    stdin_eof: Option<u64>,
+    opening: AttachmentOpening,
 ) -> Result<i32> {
     write_json_line(
         &mut broker,
         &serde_json::json!({
             "action": "attach",
-            "offsets": offsets,
-            "stdin_start": stdin_start,
-            "stdin_eof": stdin_eof,
+            "offsets": opening.offsets,
+            "stdin_start": opening.stdin_start,
+            "stdin_eof": opening.stdin_eof,
+            "attachment_id": opening.attachment_id,
         }),
     )
     .await?;
@@ -218,7 +250,7 @@ async fn proxy_attachment(
         external_error,
         broker,
         hello,
-        stdin_eof,
+        opening.stdin_eof,
     )
     .await
     .unwrap_or(1))
@@ -350,6 +382,11 @@ async fn write_raw_output<W: AsyncWrite + Unpin>(
 
 async fn stdin_eof_control(id: &str, offset: u64, mut output: Stdout) -> Result<i32> {
     let session_dir = runtime::session_dir(id)?;
+    if !session_dir.is_dir() {
+        write_typed_error_line(&mut output, "session does not exist", ERROR_SESSION_MISSING)
+            .await?;
+        return Ok(1);
+    }
     let mut connection = match connect_existing(&session_dir).await {
         Ok(connection) => connection,
         Err(error) => {
@@ -416,6 +453,41 @@ pub async fn cancel(id: &str) -> Result<i32> {
         serde_json::json!({"exit": result, "outcome": outcome})
     );
     Ok(result.process_code())
+}
+
+pub async fn detach(id: &str, attachment_id: &str) -> Result<i32> {
+    let session_dir = runtime::session_dir(id)?;
+    if !session_dir.is_dir() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "outcome": ERROR_SESSION_MISSING,
+                "error": "session does not exist",
+                "code": ERROR_SESSION_MISSING,
+            })
+        );
+        return Ok(1);
+    }
+    let mut connection = connect_existing(&session_dir).await?;
+    write_json_line(
+        &mut connection,
+        &serde_json::json!({"action": "detach", "attachment_id": attachment_id}),
+    )
+    .await?;
+    let line = read_line(&mut connection)
+        .await?
+        .context("broker closed before its detach response")?;
+    let response: serde_json::Value = serde_json::from_slice(&line)?;
+    println!("{response}");
+    if response
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+    {
+        Ok(1)
+    } else {
+        Ok(0)
+    }
 }
 
 async fn control_request(id: &str, action: &str) -> Result<serde_json::Value> {

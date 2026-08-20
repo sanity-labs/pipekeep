@@ -1,5 +1,6 @@
 use crate::protocol::{
     read_line, write_json_line, ClientAction, ClientHello, OutputOffsets, ServerHello,
+    ERROR_SESSION_ATTACHED, ERROR_SESSION_MISSING,
 };
 use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
@@ -51,12 +52,18 @@ pub async fn run(command: Vec<String>, nobuffer: bool) -> Result<i32> {
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(5));
             }
-            AttemptResult::ServerError(error) => {
-                if error.contains("session already has an attached client") {
+            AttemptResult::ServerError { error, code } => {
+                if code.as_deref() == Some(ERROR_SESSION_ATTACHED)
+                    || error.contains("session already has an attached client")
+                {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
-                if !create && !established && error.contains("session does not exist") {
+                if !create
+                    && !established
+                    && (code.as_deref() == Some(ERROR_SESSION_MISSING)
+                        || error.contains("session does not exist"))
+                {
                     create = true;
                     continue;
                 }
@@ -69,7 +76,7 @@ pub async fn run(command: Vec<String>, nobuffer: bool) -> Result<i32> {
 enum AttemptResult {
     Exited(i32),
     Disconnected { opened: bool },
-    ServerError(String),
+    ServerError { error: String, code: Option<String> },
 }
 
 enum SendOutcome {
@@ -119,7 +126,13 @@ async fn attempt(
         .context("transport returned an invalid opening JSON message")?;
     if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
         finish_transport(&mut child).await;
-        return Ok(AttemptResult::ServerError(error.to_owned()));
+        return Ok(AttemptResult::ServerError {
+            error: error.to_owned(),
+            code: value
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        });
     }
     let server: ServerHello = serde_json::from_value(value)
         .context("transport returned an invalid pipekeep handshake")?;

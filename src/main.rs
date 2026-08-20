@@ -25,11 +25,13 @@ async fn run() -> Result<i32> {
         Mode::Outer { command, nobuffer } => outer::run(command, nobuffer).await,
         Mode::Server {
             id,
+            attachment_id,
             command,
             nobuffer,
-        } => server::run(id, command, nobuffer).await,
+        } => server::run(id, attachment_id, command, nobuffer).await,
         Mode::Cancel { id } => server::cancel(&id).await,
         Mode::Pid { id } => server::pid(&id).await,
+        Mode::Detach { id, attachment_id } => server::detach(&id, &attachment_id).await,
         Mode::Broker {
             id,
             session_dir,
@@ -68,6 +70,8 @@ fn capabilities() -> serde_json::Value {
             "separate-stdout-stderr",
             "process-group-cancel",
             "cancel-outcome",
+            "typed-opening-errors",
+            "fenced-attachment-detach",
             "terminal-replay",
             "nobuffer",
         ],

@@ -28,6 +28,56 @@ fn attachment(runtime: &Path, id: &str, shell: &str) -> std::process::Child {
         .unwrap()
 }
 
+fn attachment_with_id(
+    runtime: &Path,
+    id: &str,
+    attachment_id: &str,
+    shell: &str,
+) -> std::process::Child {
+    Command::new(binary())
+        .env("PIPEKEEP_RUNTIME_DIR", runtime)
+        .env("PIPEKEEP_SESSION_TTL_SECS", "30")
+        .args([
+            "--id",
+            id,
+            "--attachment-id",
+            attachment_id,
+            "--",
+            "/bin/sh",
+            "-c",
+            shell,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn detach_json(
+    runtime: &Path,
+    id: &str,
+    attachment_id: &str,
+) -> (std::process::ExitStatus, serde_json::Value) {
+    let output = Command::new(binary())
+        .env("PIPEKEEP_RUNTIME_DIR", runtime)
+        .args(["detach", "--id", id, "--attachment-id", attachment_id])
+        .output()
+        .unwrap();
+    assert!(
+        output.stderr.is_empty(),
+        "detach stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        text.lines().count(),
+        1,
+        "detach must print one machine-readable line: {text:?}"
+    );
+    (output.status, serde_json::from_str(&text).unwrap())
+}
+
 fn read_json_line<R: Read>(reader: &mut R) -> serde_json::Value {
     let mut line = Vec::new();
     loop {
@@ -531,6 +581,8 @@ fn capabilities_probe_is_machine_readable_and_strict() {
         "separate-stdout-stderr",
         "process-group-cancel",
         "cancel-outcome",
+        "typed-opening-errors",
+        "fenced-attachment-detach",
         "terminal-replay",
         "nobuffer",
     ] {
@@ -698,6 +750,7 @@ fn rejects_second_concurrent_data_attachment() {
             .contains("already has an attached client"),
         "response: {response}"
     );
+    assert_eq!(response["code"], "session_attached");
 
     // A control declaration is still allowed alongside the data attachment
     // and cleanly ends the session command.
@@ -710,6 +763,163 @@ fn rejects_second_concurrent_data_attachment() {
         .unwrap();
     assert!(control.wait_with_output().unwrap().status.success());
     assert_eq!(first.wait().unwrap().code(), Some(0));
+}
+
+#[test]
+fn absent_resume_attachment_reports_typed_session_missing() {
+    let runtime = runtime_dir("missing-resume");
+    let mut missing = attachment(runtime.path(), "missing-resume", "unused-on-attach");
+    missing
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"offsets\":{\"stdout\":0,\"stderr\":0}}\n")
+        .unwrap();
+    let output = missing.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["code"], "session_missing");
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("session does not exist"));
+}
+
+#[test]
+fn detach_exact_id_releases_ownership_after_ack_and_preserves_command() {
+    let runtime = runtime_dir("detach-exact");
+    let mut first = attachment_with_id(runtime.path(), "detach-exact", "old", "cat");
+    let mut first_input = first.stdin.take().unwrap();
+    let mut first_output = first.stdout.take().unwrap();
+    first_input.write_all(b"{}\n").unwrap();
+    first_input.flush().unwrap();
+    let header = read_json_line(&mut first_output);
+    assert!(header.get("error").is_none(), "header: {header}");
+
+    let (status, response) = detach_json(runtime.path(), "detach-exact", "old");
+    assert!(status.success(), "response: {response}");
+    assert_eq!(response["outcome"], "detached");
+    assert_eq!(first.wait().unwrap().code(), Some(0));
+    drop(first_input);
+
+    let mut replacement = attachment_with_id(runtime.path(), "detach-exact", "new", "unused");
+    replacement
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"offsets\":{\"stdout\":0,\"stderr\":0},\"stdin_eof\":3}\nabc")
+        .unwrap();
+    let output = replacement.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, body) = split_header(&output.stdout);
+    assert_eq!(body, b"abc");
+}
+
+#[test]
+fn stale_detach_cannot_revoke_replacement_attachment() {
+    let runtime = runtime_dir("detach-stale");
+    let mut first = attachment_with_id(runtime.path(), "detach-stale", "old", "cat");
+    let mut first_input = first.stdin.take().unwrap();
+    let mut first_output = first.stdout.take().unwrap();
+    first_input.write_all(b"{}\n").unwrap();
+    first_input.flush().unwrap();
+    let header = read_json_line(&mut first_output);
+    assert!(header.get("error").is_none(), "header: {header}");
+
+    let (status, response) = detach_json(runtime.path(), "detach-stale", "old");
+    assert!(status.success(), "response: {response}");
+    assert_eq!(response["outcome"], "detached");
+    assert_eq!(first.wait().unwrap().code(), Some(0));
+    drop(first_input);
+
+    let mut replacement = attachment_with_id(runtime.path(), "detach-stale", "new", "unused");
+    let mut replacement_input = replacement.stdin.take().unwrap();
+    let mut replacement_output = replacement.stdout.take().unwrap();
+    replacement_input
+        .write_all(b"{\"offsets\":{\"stdout\":0,\"stderr\":0},\"stdin_eof\":4}\n")
+        .unwrap();
+    replacement_input.flush().unwrap();
+    let header = read_json_line(&mut replacement_output);
+    assert!(header.get("error").is_none(), "header: {header}");
+
+    let (status, response) = detach_json(runtime.path(), "detach-stale", "old");
+    assert_eq!(status.code(), Some(1), "response: {response}");
+    assert_eq!(response["outcome"], "attachment_mismatch");
+    assert_eq!(response["code"], "attachment_mismatch");
+
+    replacement_input.write_all(b"live").unwrap();
+    replacement_input.flush().unwrap();
+    let mut body = [0_u8; 4];
+    replacement_output.read_exact(&mut body).unwrap();
+    assert_eq!(&body, b"live");
+    assert_eq!(replacement.wait().unwrap().code(), Some(0));
+}
+
+#[test]
+fn repeated_and_concurrent_detach_is_idempotent() {
+    let runtime = runtime_dir("detach-idempotent");
+    let mut attached = attachment_with_id(runtime.path(), "detach-idempotent", "same", "cat");
+    let mut attached_input = attached.stdin.take().unwrap();
+    let mut attached_output = attached.stdout.take().unwrap();
+    attached_input.write_all(b"{}\n").unwrap();
+    attached_input.flush().unwrap();
+    let header = read_json_line(&mut attached_output);
+    assert!(header.get("error").is_none(), "header: {header}");
+
+    let first = Command::new(binary())
+        .env("PIPEKEEP_RUNTIME_DIR", runtime.path())
+        .args([
+            "detach",
+            "--id",
+            "detach-idempotent",
+            "--attachment-id",
+            "same",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let second = Command::new(binary())
+        .env("PIPEKEEP_RUNTIME_DIR", runtime.path())
+        .args([
+            "detach",
+            "--id",
+            "detach-idempotent",
+            "--attachment-id",
+            "same",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let first_output = first.wait_with_output().unwrap();
+    let second_output = second.wait_with_output().unwrap();
+    for output in [&first_output, &second_output] {
+        assert!(
+            output.status.success(),
+            "stdout: {}, stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            response["outcome"] == "detached" || response["outcome"] == "already_detached",
+            "response: {response}"
+        );
+    }
+    assert_eq!(attached.wait().unwrap().code(), Some(0));
+    drop(attached_input);
+
+    let (status, response) = detach_json(runtime.path(), "detach-idempotent", "same");
+    assert!(status.success(), "response: {response}");
+    assert_eq!(response["outcome"], "already_detached");
 }
 
 #[test]
@@ -757,6 +967,7 @@ fn removes_completed_session_after_short_ttl() {
     let output = late.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["code"], "session_missing");
     assert!(response["error"]
         .as_str()
         .unwrap()

@@ -1,6 +1,7 @@
 use crate::protocol::{
-    read_frame, read_line, write_error_line, write_frame, write_json_line, AllOffsets,
-    CancelOutcome, ExitResult, Frame, OutputOffsets, ServerHello,
+    read_frame, read_line, write_error_line, write_frame, write_json_line, write_typed_error_line,
+    AllOffsets, CancelOutcome, ExitResult, Frame, OutputOffsets, ServerHello,
+    ERROR_ATTACHMENT_MISMATCH, ERROR_SESSION_ATTACHED,
 };
 use crate::runtime;
 use anyhow::{bail, Context, Result};
@@ -12,9 +13,9 @@ use std::fs;
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{ChildStdin, Command};
@@ -26,6 +27,8 @@ const CHUNK_SIZE: usize = 32 * 1024;
 #[serde(tag = "action", rename_all = "lowercase")]
 enum Request {
     Attach {
+        #[serde(default = "generated_attachment_id")]
+        attachment_id: String,
         #[serde(default)]
         offsets: OutputOffsets,
         #[serde(default)]
@@ -39,6 +42,9 @@ enum Request {
     },
     Pid,
     Cancel,
+    Detach {
+        attachment_id: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +65,17 @@ struct Meta {
     status: Option<ExitResult>,
 }
 
+#[derive(Default)]
+struct AttachmentSlot {
+    current: Option<AttachmentRecord>,
+}
+
+struct AttachmentRecord {
+    id: String,
+    cancel: watch::Sender<bool>,
+    released: watch::Receiver<bool>,
+}
+
 struct Shared {
     meta: Mutex<Meta>,
     child_stdin: Mutex<Option<ChildStdin>>,
@@ -70,7 +87,7 @@ struct Shared {
     stderr_path: PathBuf,
     command_pid: i32,
     nobuffer: bool,
-    attached: AtomicBool,
+    attachment: StdMutex<AttachmentSlot>,
     active_attachments: AtomicUsize,
 }
 
@@ -80,6 +97,36 @@ impl Shared {
             self.terminal.send_replace(true);
         }
     }
+
+    fn attach(self: &Arc<Self>, id: String) -> std::result::Result<AttachmentGuard, ()> {
+        let mut slot = self.attachment.lock().unwrap();
+        if slot.current.is_some() {
+            return Err(());
+        }
+        let (cancel, cancel_rx) = watch::channel(false);
+        let (released, released_rx) = watch::channel(false);
+        slot.current = Some(AttachmentRecord {
+            id: id.clone(),
+            cancel,
+            released: released_rx,
+        });
+        Ok(AttachmentGuard {
+            shared: self.clone(),
+            id,
+            cancel: cancel_rx,
+            released,
+        })
+    }
+}
+
+fn generated_attachment_id() -> String {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("broker-local-{}-{nanos}-{sequence}", std::process::id())
 }
 
 struct SessionGuard(PathBuf);
@@ -150,7 +197,7 @@ pub async fn run(
         stderr_path,
         command_pid,
         nobuffer,
-        attached: AtomicBool::new(false),
+        attachment: StdMutex::new(AttachmentSlot::default()),
         active_attachments: AtomicUsize::new(0),
     });
 
@@ -299,10 +346,22 @@ async fn handle_connection(mut stream: UnixStream, shared: Arc<Shared>) -> Resul
             Err(error) => write_error_line(&mut stream, &error.to_string()).await,
         },
         Request::Attach {
+            attachment_id,
             offsets,
             stdin_start,
             stdin_eof,
-        } => attach(stream, shared, offsets, stdin_start, stdin_eof).await,
+        } => {
+            attach(
+                stream,
+                shared,
+                attachment_id,
+                offsets,
+                stdin_start,
+                stdin_eof,
+            )
+            .await
+        }
+        Request::Detach { attachment_id } => detach(stream, shared, attachment_id).await,
         Request::StdinEof { offset } => match declare_stdin_eof(&shared, offset).await {
             Ok(()) => {
                 let meta = shared.meta.lock().await;
@@ -321,11 +380,25 @@ async fn handle_connection(mut stream: UnixStream, shared: Arc<Shared>) -> Resul
     }
 }
 
-struct AttachmentGuard(Arc<Shared>);
+struct AttachmentGuard {
+    shared: Arc<Shared>,
+    id: String,
+    cancel: watch::Receiver<bool>,
+    released: watch::Sender<bool>,
+}
 
 impl Drop for AttachmentGuard {
     fn drop(&mut self) {
-        self.0.attached.store(false, Ordering::Release);
+        let mut slot = self.shared.attachment.lock().unwrap();
+        if slot
+            .current
+            .as_ref()
+            .is_some_and(|current| current.id == self.id)
+        {
+            slot.current = None;
+        }
+        drop(slot);
+        self.released.send_replace(true);
     }
 }
 
@@ -340,19 +413,23 @@ impl Drop for ConnectionGuard {
 async fn attach(
     mut stream: UnixStream,
     shared: Arc<Shared>,
+    attachment_id: String,
     offsets: OutputOffsets,
     stdin_start: u64,
     stdin_eof: Option<u64>,
 ) -> Result<()> {
-    if shared
-        .attached
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        write_error_line(&mut stream, "session already has an attached client").await?;
-        return Ok(());
-    }
-    let _guard = AttachmentGuard(shared.clone());
+    let mut guard = match shared.attach(attachment_id) {
+        Ok(guard) => guard,
+        Err(()) => {
+            write_typed_error_line(
+                &mut stream,
+                "session already has an attached client",
+                ERROR_SESSION_ATTACHED,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     // Subscribe before taking the snapshot so a live chunk cannot fall between
     // the returned offset and the receiver subscription.
@@ -458,6 +535,10 @@ async fn attach(
 
     tokio::select! {
         biased;
+        _ = guard.cancel.changed() => {
+            input.abort();
+            output.abort();
+        }
         result = &mut output => {
             input.abort();
             result??;
@@ -468,6 +549,61 @@ async fn attach(
         }
     }
     Ok(())
+}
+
+async fn detach(mut stream: UnixStream, shared: Arc<Shared>, attachment_id: String) -> Result<()> {
+    enum DetachAction {
+        AlreadyDetached,
+        AttachmentMismatch,
+        Signal {
+            cancel: watch::Sender<bool>,
+            released: watch::Receiver<bool>,
+        },
+    }
+
+    let action = {
+        let slot = shared.attachment.lock().unwrap();
+        match slot.current.as_ref() {
+            None => DetachAction::AlreadyDetached,
+            Some(current) if current.id != attachment_id => DetachAction::AttachmentMismatch,
+            Some(current) => DetachAction::Signal {
+                cancel: current.cancel.clone(),
+                released: current.released.clone(),
+            },
+        }
+    };
+
+    match action {
+        DetachAction::AlreadyDetached => {
+            write_json_line(
+                &mut stream,
+                &serde_json::json!({"outcome": "already_detached"}),
+            )
+            .await
+        }
+        DetachAction::AttachmentMismatch => {
+            write_json_line(
+                &mut stream,
+                &serde_json::json!({
+                    "outcome": ERROR_ATTACHMENT_MISMATCH,
+                    "error": "attachment ID does not own the active client",
+                    "code": ERROR_ATTACHMENT_MISMATCH,
+                }),
+            )
+            .await
+        }
+        DetachAction::Signal {
+            cancel,
+            mut released,
+        } => {
+            let _ = cancel.send(true);
+            released
+                .wait_for(|released| *released)
+                .await
+                .context("attachment release signal closed unexpectedly")?;
+            write_json_line(&mut stream, &serde_json::json!({"outcome": "detached"})).await
+        }
+    }
 }
 
 async fn receive_input<R: AsyncRead + Unpin>(

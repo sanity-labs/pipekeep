@@ -42,7 +42,8 @@ stdin writer and one stdout/stderr reader.
 
 It is not a terminal multiplexer, job scheduler, process supervisor, or remote
 shell. It does not allocate a PTY, manage multiple readers, or provide a
-general remote-control interface beyond cancellation and PID lookup.
+general remote-control interface beyond attachment detach, cancellation, and
+PID lookup.
 
 The session exists only inside the lifetime and namespaces of the machine,
 container, or pod where it was created. In particular, Kubernetes Exec can be
@@ -54,7 +55,8 @@ or the pod is replaced.
 ```text
 Usage:
   pipekeep [--] TRANSPORT [ARG...]
-  pipekeep --id ID [--nobuffer] -- COMMAND [ARG...]
+  pipekeep --id ID [--attachment-id ATTACHMENT] [--nobuffer] -- COMMAND [ARG...]
+  pipekeep detach --id ID --attachment-id ATTACHMENT
   pipekeep cancel --id ID
   pipekeep pid --id ID
 
@@ -68,6 +70,11 @@ Modes:
       opening protocol message requests a resume. Only one client may be
       attached at a time.
 
+  pipekeep detach --id ID --attachment-id ATTACHMENT
+      Release exactly the matching data attachment, wait until broker
+      ownership is clear, and leave the command and sticky stdin EOF state
+      untouched.
+
   pipekeep cancel --id ID
       Request graceful termination, escalate if necessary, wait until the
       process group is settled, and return the command's authoritative
@@ -80,6 +87,12 @@ Modes:
 Options:
   --id ID
       Name the remote session.
+
+  --attachment-id ATTACHMENT
+      Fresh, non-reused opaque identity for this data attachment. Controllers
+      must generate a new value for every attachment so stale detach requests
+      cannot match a replacement. If omitted, the server form generates a
+      unique local value for compatibility with older callers.
 
   --nobuffer
       Do not spool unbounded replay data. The outer form keeps only a bounded
@@ -129,10 +142,23 @@ invocation that created the session. Later attachments and `cancel`
 invocations cannot change them; set them in the environment of the
 session-creating remote invocation.
 
-A session has at most one attached data client. A second data attachment is
-rejected, although idempotent control requests such as an EOF declaration may
-run alongside it. This avoids ambiguous stdin ownership and
-output-consumption rules.
+A session has at most one attached data client. Every data attachment has an
+opaque attachment ID. A second data attachment is rejected with a typed opening
+error, although idempotent control requests such as an EOF declaration may run
+alongside it. This avoids ambiguous stdin ownership and output-consumption
+rules.
+
+`pipekeep detach --id ID --attachment-id ATTACHMENT` connects to the broker and
+asks it to release exactly that attachment. If the active ID matches, the
+broker signals only that attach loop, waits until its fenced guard has actually
+cleared broker ownership, then acknowledges with `{"outcome":"detached"}`.
+If no attachment remains it returns `{"outcome":"already_detached"}` and exits
+successfully. If another attachment owns the slot it returns
+`{"outcome":"attachment_mismatch","error":"...","code":"attachment_mismatch"}`
+without detaching it. An absent session returns
+`{"outcome":"session_missing","error":"session does not exist","code":"session_missing"}`.
+Detach never cancels the command process group and never declares or changes
+sticky stdin EOF.
 
 The broker records absolute byte positions for all three streams. Position
 `N` means that `N` bytes precede the next byte. Positions begin at zero and
@@ -169,6 +195,17 @@ The returned stdin position is authoritative: it is the first stdin byte the
 server still needs. The client sends raw stdin beginning at that position. The
 returned stdout and stderr positions are the first raw bytes the server will
 provide. They may be greater than requested when data was not retained.
+
+Opening errors are JSON objects with a human-readable `error`. Stable machine
+codes are present for authoritative missing-session resume attempts and live
+data-attachment contention:
+
+```json
+{"error":"session does not exist","code":"session_missing"}
+{"error":"session already has an attached client","code":"session_attached"}
+```
+
+Other opening failures may remain untyped.
 
 A client that has already observed local stdin EOF includes its absolute end:
 
@@ -211,8 +248,9 @@ Unknown JSON fields are ignored. A future incompatible protocol can add an
 explicit version field and reject versions it cannot understand. The
 `pipekeep capabilities --json` probe reports this handshake as attachment
 protocol `1`, together with the package version, the build's source revision,
-and the supported capability names, so an upper layer can verify binary
-compatibility before creating sessions.
+and the supported capability names, including `typed-opening-errors` and
+`fenced-attachment-detach`, so an upper layer can verify binary compatibility
+before creating sessions.
 
 ## Raw stream transport
 

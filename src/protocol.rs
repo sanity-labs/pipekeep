@@ -6,6 +6,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Compatible additions keep this number; an incompatible change bumps it.
 pub const ATTACHMENT_PROTOCOL_VERSION: u32 = 1;
 
+pub const ERROR_SESSION_ATTACHED: &str = "session_attached";
+pub const ERROR_SESSION_MISSING: &str = "session_missing";
+pub const ERROR_ATTACHMENT_MISMATCH: &str = "attachment_mismatch";
+
 pub const MAX_JSON_LINE: usize = 64 * 1024;
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
@@ -136,6 +140,14 @@ pub async fn write_json_line<W: AsyncWrite + Unpin, T: Serialize>(
 
 pub async fn write_error_line<W: AsyncWrite + Unpin>(writer: &mut W, error: &str) -> Result<()> {
     write_json_line(writer, &serde_json::json!({ "error": error })).await
+}
+
+pub async fn write_typed_error_line<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    error: &str,
+    code: &str,
+) -> Result<()> {
+    write_json_line(writer, &serde_json::json!({ "error": error, "code": code })).await
 }
 
 pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -> Result<()> {

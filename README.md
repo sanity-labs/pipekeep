@@ -34,7 +34,8 @@ order), with user-only permissions.
 
 ```text
 pipekeep [--nobuffer] [--] TRANSPORT [ARG...]
-pipekeep --id ID [--nobuffer] -- COMMAND [ARG...]
+pipekeep --id ID [--attachment-id ATTACHMENT] [--nobuffer] -- COMMAND [ARG...]
+pipekeep detach --id ID --attachment-id ATTACHMENT
 pipekeep cancel --id ID
 pipekeep pid --id ID
 pipekeep capabilities --json
@@ -49,6 +50,19 @@ final status and prints one machine-readable JSON line such as
 group member and `already_exited` when the group had already settled before
 anything could be signaled; the retained exit result is never relabeled by
 the outcome. `pid` prints the command leader's PID.
+
+`--attachment-id` gives a data attachment an opaque identity. Controllers must
+generate a fresh, non-reused ID for every attachment so stale detach requests
+cannot match a replacement attachment. If omitted, the inner `pipekeep`
+generates one for compatibility with older callers. `detach` asks the broker
+to release exactly the matching data attachment without
+canceling the command or declaring stdin EOF. It prints one JSON line:
+`{"outcome":"detached"}` after the broker slot is clear,
+`{"outcome":"already_detached"}` when no attachment remains,
+`{"outcome":"attachment_mismatch","error":"...","code":"attachment_mismatch"}`
+when another attachment owns the slot, or
+`{"outcome":"session_missing","error":"session does not exist","code":"session_missing"}`
+when the session is absent.
 
 By default, stdin replay uses an unlinked temporary file in the outer process,
 and the broker spools stdout/stderr in its private session directory. Both
@@ -68,7 +82,7 @@ invocation when input should also use bounded-window semantics.
 use to verify it is talking to a compatible binary:
 
 ```json
-{"capabilities":["raw-public-streams","absolute-resume-offsets","sticky-stdin-eof","separate-stdout-stderr","process-group-cancel","cancel-outcome","terminal-replay","nobuffer"],"name":"pipekeep","protocol":1,"revision":"<source revision>","version":"0.1.0"}
+{"capabilities":["raw-public-streams","absolute-resume-offsets","sticky-stdin-eof","separate-stdout-stderr","process-group-cancel","cancel-outcome","typed-opening-errors","fenced-attachment-detach","terminal-replay","nobuffer"],"name":"pipekeep","protocol":1,"revision":"<source revision>","version":"0.1.0"}
 ```
 
 `protocol` is the attachment protocol version described below. `revision` is
@@ -102,6 +116,10 @@ is the absolute input end; `stdin_eof: true` in a response confirms that the
 broker has reached it. Response values `stdout_eof` and `stderr_eof` are the
 absolute output ends. A retained `exit` contains either `code` or `signal`.
 See [design.md](design.md) for the complete reconnection rules.
+
+Opening failures always keep a human-readable `error`. Missing-session resume
+attempts include `code:"session_missing"`; data-attachment contention includes
+`code:"session_attached"`. Other failures may remain untyped.
 
 ## Runtime tuning
 
