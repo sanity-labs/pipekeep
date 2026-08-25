@@ -1,6 +1,6 @@
 use crate::protocol::{
-    read_frame, read_line, write_error_line, write_frame, write_json_line, ClientAction,
-    ClientHello, ExitResult, Frame, OutputOffsets, ServerHello,
+    read_frame, read_line, write_error_line, write_frame, write_json_line, CancelOutcome,
+    ClientAction, ClientHello, ExitResult, Frame, OutputOffsets, ServerHello,
 };
 use crate::runtime;
 use anyhow::{bail, Context, Result};
@@ -405,6 +405,16 @@ pub async fn cancel(id: &str) -> Result<i32> {
             .cloned()
             .context("broker returned an invalid cancellation response")?,
     )?;
+    let outcome: CancelOutcome = serde_json::from_value(
+        response
+            .get("outcome")
+            .cloned()
+            .context("broker returned no cancellation outcome")?,
+    )?;
+    println!(
+        "{}",
+        serde_json::json!({"exit": result, "outcome": outcome})
+    );
     Ok(result.process_code())
 }
 

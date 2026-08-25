@@ -104,9 +104,15 @@ period, and sends `SIGKILL` to any remaining members. It then waits until the
 entire process group is settled and the broker has recorded the terminal
 result.
 
-`cancel` returns that terminal result. If the command exits naturally before
-cancellation wins the race, its real exit result is preserved rather than
-being relabeled as canceled. Already-buffered stdout and stderr remain
+`cancel` returns that terminal result together with a machine-readable
+`outcome`: `cancel_won` when the TERM or KILL attempt reached at least one
+still-live member of the recorded process group, `already_exited` when the
+group had settled before cancellation could signal any remaining member. The
+outcome is decided from the actual signal attempts, so a group that
+disappears between inspection and signaling resolves honestly to
+`already_exited` rather than a fabricated win. If the command exits naturally
+before cancellation wins the race, its real exit result is preserved rather
+than being relabeled as canceled. Already-buffered stdout and stderr remain
 available, and an attached client receives the remaining output and the same
 terminal result. A session that does not exist is an error.
 

@@ -49,6 +49,47 @@ fn split_header(stdout: &[u8]) -> (serde_json::Value, &[u8]) {
     )
 }
 
+// A session-creating attachment whose broker inherits an explicit
+// cancellation grace period; the TTL keeps the settled session around for
+// the control requests that follow.
+fn cancellable_attachment(
+    runtime: &Path,
+    id: &str,
+    shell: &str,
+    grace_secs: &str,
+) -> std::process::Child {
+    Command::new(binary())
+        .env("PIPEKEEP_RUNTIME_DIR", runtime)
+        .env("PIPEKEEP_SESSION_TTL_SECS", "30")
+        .env("PIPEKEEP_CANCEL_GRACE_SECS", grace_secs)
+        .args(["--id", id, "--", "/bin/sh", "-c", shell])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn cancel_json(runtime: &Path, id: &str) -> (std::process::ExitStatus, serde_json::Value) {
+    let output = Command::new(binary())
+        .env("PIPEKEEP_RUNTIME_DIR", runtime)
+        .args(["cancel", "--id", id])
+        .output()
+        .unwrap();
+    assert!(
+        output.stderr.is_empty(),
+        "cancel stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        text.lines().count(),
+        1,
+        "cancel must print one machine-readable line: {text:?}"
+    );
+    (output.status, serde_json::from_str(&text).unwrap())
+}
+
 fn outer_command(runtime: &Path, id: &str, shell: &str) -> Command {
     let binary = binary();
     let mut command = Command::new(&binary);
@@ -282,15 +323,12 @@ fn pid_and_cancel_control_the_command_group() {
         .parse::<u32>()
         .is_ok());
 
-    let canceled = Command::new(&binary)
-        .env("PIPEKEEP_RUNTIME_DIR", runtime.path())
-        .env("PIPEKEEP_CANCEL_GRACE_SECS", "0")
-        .args(["cancel", "--id", "cancel-me"])
-        .status()
-        .unwrap();
+    let (canceled, response) = cancel_json(runtime.path(), "cancel-me");
     // The leader accepted SIGTERM before escalation, so its authoritative
     // result is 128 + SIGTERM rather than being relabeled as canceled.
     assert_eq!(canceled.code(), Some(143));
+    assert_eq!(response["outcome"], "cancel_won");
+    assert_eq!(response["exit"]["signal"], 15);
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -301,6 +339,118 @@ fn pid_and_cancel_control_the_command_group() {
         assert!(Instant::now() < deadline, "outer pipekeep did not exit");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn cancel_after_natural_completion_reports_already_exited() {
+    let runtime = runtime_dir("cancel-exited");
+    let mut child =
+        cancellable_attachment(runtime.path(), "cancel-exited", "printf done; exit 5", "5");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"stdin_eof\":0}\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    // The attachment saw the terminal result, so the leader is reaped and
+    // the group settled before the cancellation below signals anything.
+    assert_eq!(output.status.code(), Some(5));
+    let (_, body) = split_header(&output.stdout);
+    assert_eq!(body, b"done");
+
+    let (status, response) = cancel_json(runtime.path(), "cancel-exited");
+    assert_eq!(response["outcome"], "already_exited");
+    // The retained natural result passes through unchanged.
+    assert_eq!(response["exit"]["code"], 5);
+    assert!(response["exit"].get("signal").is_none());
+    assert_eq!(status.code(), Some(5));
+}
+
+#[test]
+fn term_delivered_cancellation_reports_cancel_won() {
+    let runtime = runtime_dir("cancel-term");
+    let mut child =
+        cancellable_attachment(runtime.path(), "cancel-term", "printf R; sleep 30", "5");
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(b"{}\n").unwrap();
+    input.flush().unwrap();
+    let mut output_pipe = child.stdout.take().unwrap();
+    read_json_line(&mut output_pipe);
+    let mut byte = [0_u8; 1];
+    output_pipe.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"R");
+
+    let (status, response) = cancel_json(runtime.path(), "cancel-term");
+    assert_eq!(response["outcome"], "cancel_won");
+    assert_eq!(response["exit"]["signal"], 15);
+    assert!(response["exit"].get("code").is_none());
+    assert_eq!(status.code(), Some(143));
+
+    // The attached client receives the same retained result.
+    assert_eq!(child.wait().unwrap().code(), Some(143));
+    drop(input);
+}
+
+#[test]
+fn kill_escalation_after_ignored_term_reports_cancel_won() {
+    let runtime = runtime_dir("cancel-kill");
+    // The leader ignores TERM and keeps its group alive past the grace
+    // period, forcing the KILL escalation.
+    let mut child = cancellable_attachment(
+        runtime.path(),
+        "cancel-kill",
+        "trap '' TERM; printf R; while :; do sleep 1; done",
+        "1",
+    );
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(b"{}\n").unwrap();
+    input.flush().unwrap();
+    let mut output_pipe = child.stdout.take().unwrap();
+    read_json_line(&mut output_pipe);
+    let mut byte = [0_u8; 1];
+    output_pipe.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"R");
+
+    let (status, response) = cancel_json(runtime.path(), "cancel-kill");
+    assert_eq!(response["outcome"], "cancel_won");
+    assert_eq!(response["exit"]["signal"], 9);
+    assert!(response["exit"].get("code").is_none());
+    assert_eq!(status.code(), Some(137));
+
+    assert_eq!(child.wait().unwrap().code(), Some(137));
+    drop(input);
+}
+
+#[test]
+fn cancel_of_settled_group_never_fabricates_a_win() {
+    let runtime = runtime_dir("cancel-gone");
+    let mut child =
+        cancellable_attachment(runtime.path(), "cancel-gone", "printf R; sleep 30", "5");
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(b"{}\n").unwrap();
+    input.flush().unwrap();
+    let mut output_pipe = child.stdout.take().unwrap();
+    read_json_line(&mut output_pipe);
+    let mut byte = [0_u8; 1];
+    output_pipe.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"R");
+
+    let (status, first) = cancel_json(runtime.path(), "cancel-gone");
+    assert_eq!(first["outcome"], "cancel_won");
+    assert_eq!(status.code(), Some(143));
+    assert_eq!(child.wait().unwrap().code(), Some(143));
+    drop(input);
+
+    // The recorded process group is now fully settled and reaped, so this
+    // cancellation's signal attempt reaches nobody. The outcome must resolve
+    // from that failed attempt — already_exited, with the retained
+    // signal-termination result untouched rather than relabeled.
+    let (status, second) = cancel_json(runtime.path(), "cancel-gone");
+    assert_eq!(second["outcome"], "already_exited");
+    assert_eq!(second["exit"]["signal"], 15);
+    assert!(second["exit"].get("code").is_none());
+    assert_eq!(status.code(), Some(143));
 }
 
 #[test]
@@ -380,6 +530,7 @@ fn capabilities_probe_is_machine_readable_and_strict() {
         "sticky-stdin-eof",
         "separate-stdout-stderr",
         "process-group-cancel",
+        "cancel-outcome",
         "terminal-replay",
         "nobuffer",
     ] {
