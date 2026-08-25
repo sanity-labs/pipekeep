@@ -30,6 +30,70 @@ cargo test
 `$PIPEKEEP_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/pipekeep`, or `/tmp/pipekeep-$UID` (in that
 order), with user-only permissions.
 
+## Standalone Acceptance Harness
+
+The repository includes a self-contained acceptance harness that uses only the
+compiled `pipekeep` CLI, Rust, `/bin/sh`, files, pipes, and Unix signals. It
+does not use Persona code or services, Kubernetes, Postgres, Docker, or a
+network dependency.
+
+Run the deterministic smoke with one command:
+
+```sh
+cargo run --bin pipekeep-acceptance -- smoke
+```
+
+A passing smoke prints controller summaries and ends with lines like:
+
+```text
+ok: buffered stdin replay verified len=524288 sha256=05b7fc050ea022110a59b24af26b8f972a4eae005b3024a6b0a3bdc1465b317d transport_deaths=3 seed=0 outer_pid=12345
+ok: cancellation JSON and process-group termination verified
+ok: negative cases verified
+ok: stdout=1760 bytes stderr=1760 bytes exit=42 seed=0 cycles=3
+```
+
+The smoke starts a workload once under a detached broker, kills multiple
+short-lived attachment proxies while the broker and workload continue, stores
+stdout/stderr absolute offsets in files outside each controller process, and
+reconnects fresh controller processes to the same session. It then lets the
+workload finish while no data attachment is alive, replays the remaining
+stdout/stderr exactly once, and observes the authoritative retained exit
+status. It also runs a public two-sided stdin replay scenario:
+finite deterministic binary producer to one long-lived outer `pipekeep --`
+process, a killable local transport process, inner `pipekeep --id`, and a
+slow stdin-consuming workload. The harness kills restarted transports while
+stdin is in flight, including after producer EOF, then verifies the workload's
+exact accepted bytes, deterministic stdout/stderr, and authoritative exit. It
+also verifies machine-readable cancellation, process-group termination,
+concurrent-attachment rejection, missing-session rejection, ahead-offset
+rejection, stale no-buffer replay gap reporting, and replay expiry after the
+completed-session TTL.
+
+Seeded chaos mode repeats the same exactness and single-launch assertions with
+bounded randomized disconnect timings:
+
+```sh
+cargo run --bin pipekeep-acceptance -- chaos --seed 12345 --cycles 12
+```
+
+Omit `--seed` to generate and print one, then reuse it to reproduce a failure.
+Use `--cycles N` to set the number of forced attachment losses. Use
+`--retain-temp` to keep the harness temp directory on success; on failure the
+temp directory is retained automatically for diagnostics. If the `pipekeep`
+binary is not next to the harness binary, the harness builds it with
+`cargo build --bin pipekeep`; `--pipekeep PATH` or `PIPEKEEP_BIN=PATH` can
+select an explicit binary.
+
+The harness exercises Pipekeep's intended resumability boundary: attachment or
+transport process loss while the detached broker, its session directory, and
+the workload's host/container/pod survive. Broker death, container death, pod
+replacement, host reboot, or loss of the session directory is outside
+Pipekeep's resumability boundary; those failures cannot be resumed by this
+protocol. Buffered stdin replay additionally requires the same outer
+`pipekeep` process to survive because its default stdin replay buffer is a
+process-local unlinked temporary file. Restarting the outer process loses that
+buffer and is not claimed as resumable.
+
 ## Commands
 
 ```text
@@ -113,7 +177,8 @@ is captured when the session is created. Set them in the environment of the
 session-creating remote invocation; later attachments and `cancel` invocations
 cannot change them.
 
-Replay buffers are process-lifetime aids, not durable storage. A broker keeps
+Replay buffers are process-lifetime aids, not durable storage. The default
+outer stdin buffer is retained only by that outer process. A broker keeps
 completed output and exit state for the TTL so a final transport failure can
 still be resumed.
 
