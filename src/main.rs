@@ -27,7 +27,8 @@ async fn run() -> Result<i32> {
             id,
             command,
             nobuffer,
-        } => server::run(id, command, nobuffer).await,
+            force,
+        } => server::run(id, command, nobuffer, force).await,
         Mode::Cancel { id } => server::cancel(&id).await,
         Mode::Pid { id } => server::pid(&id).await,
         Mode::Broker {
@@ -70,6 +71,7 @@ fn capabilities() -> serde_json::Value {
             "cancel-outcome",
             "terminal-replay",
             "nobuffer",
+            "forced-attach-takeover",
         ],
     })
 }

@@ -11,6 +11,7 @@ pub enum Mode {
         id: String,
         command: Vec<String>,
         nobuffer: bool,
+        force: bool,
     },
     Cancel {
         id: String,
@@ -46,6 +47,7 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
 
     let mut id = None;
     let mut nobuffer = false;
+    let mut force = false;
     let index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -59,6 +61,10 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
             }
             "--nobuffer" => {
                 nobuffer = true;
+                args.remove(index);
+            }
+            "--force" => {
+                force = true;
                 args.remove(index);
             }
             "--" => {
@@ -78,8 +84,12 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
             id,
             command: args,
             nobuffer,
+            force,
         })
     } else {
+        if force {
+            bail!("--force requires --id and only applies to attach-only sessions");
+        }
         Ok(Mode::Outer {
             command: args,
             nobuffer,
@@ -153,7 +163,7 @@ pub const HELP: &str = r#"pipekeep: resumable process pipes
 
 Usage:
   pipekeep [--nobuffer] [--] TRANSPORT [ARG...]
-  pipekeep --id ID [--nobuffer] -- COMMAND [ARG...]
+  pipekeep --id ID [--nobuffer] [--force] -- COMMAND [ARG...]
   pipekeep cancel --id ID
   pipekeep pid --id ID
   pipekeep capabilities --json
@@ -161,6 +171,8 @@ Usage:
 
 The outer form reruns TRANSPORT after a disconnection. The --id form creates
 or attaches to a detached process session using the opening protocol message.
+With --id, --force applies only to attach-only opening requests and supersedes
+an existing data attachment without restarting the command.
 `capabilities --json` prints a machine-readable compatibility probe.
 "#;
 
@@ -178,6 +190,18 @@ mod tests {
             parse(vec!["--id".into(), "x".into(), "--".into(), "cat".into()]).unwrap(),
             Mode::Server { .. }
         ));
+        assert!(matches!(
+            parse(vec![
+                "--id".into(),
+                "x".into(),
+                "--force".into(),
+                "--".into(),
+                "cat".into()
+            ])
+            .unwrap(),
+            Mode::Server { force: true, .. }
+        ));
+        assert!(parse(vec!["--force".into(), "--".into(), "ssh".into()]).is_err());
     }
 
     #[test]

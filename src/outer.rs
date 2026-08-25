@@ -103,6 +103,7 @@ async fn attempt(
         offsets: if create { None } else { Some(*delivered) },
         stdin_start: input_state.start,
         stdin_eof: input_state.eof,
+        force: false,
     };
     if write_json_line(&mut transport_input, &hello).await.is_err() {
         finish_transport(&mut child).await;
@@ -293,6 +294,7 @@ async fn declare_remote_stdin_eof(
             offsets: None,
             stdin_start: 0,
             stdin_eof: Some(offset),
+            force: false,
         },
     )
     .await?;

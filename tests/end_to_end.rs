@@ -1,8 +1,9 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 fn binary() -> PathBuf {
@@ -28,6 +29,34 @@ fn attachment(runtime: &Path, id: &str, shell: &str) -> std::process::Child {
         .unwrap()
 }
 
+fn forced_attachment(runtime: &Path, id: &str, shell: &str) -> std::process::Child {
+    Command::new(binary())
+        .env("PIPEKEEP_RUNTIME_DIR", runtime)
+        .env("PIPEKEEP_SESSION_TTL_SECS", "30")
+        .args(["--id", id, "--force", "--", "/bin/sh", "-c", shell])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn request(value: serde_json::Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(&value).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+fn write_request(child: &mut Child, value: serde_json::Value) {
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&request(value))
+        .unwrap();
+    child.stdin.as_mut().unwrap().flush().unwrap();
+}
+
 fn read_json_line<R: Read>(reader: &mut R) -> serde_json::Value {
     let mut line = Vec::new();
     loop {
@@ -39,6 +68,45 @@ fn read_json_line<R: Read>(reader: &mut R) -> serde_json::Value {
         line.push(byte[0]);
     }
     serde_json::from_slice(&line).unwrap()
+}
+
+fn wait_exited(child: &mut Child, label: &str) -> ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "{label} did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_displaced(child: &mut Child, label: &str) {
+    let _ = wait_exited(child, label);
+}
+
+fn session_socket(runtime: &Path) -> PathBuf {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        for entry in fs::read_dir(runtime).unwrap() {
+            let socket = entry.unwrap().path().join("broker.sock");
+            if socket.exists() {
+                return socket;
+            }
+        }
+        assert!(Instant::now() < deadline, "broker socket did not appear");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn pid_text(runtime: &Path, id: &str) -> String {
+    let output = Command::new(binary())
+        .env("PIPEKEEP_RUNTIME_DIR", runtime)
+        .args(["pid", "--id", id])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap()
 }
 
 fn split_header(stdout: &[u8]) -> (serde_json::Value, &[u8]) {
@@ -533,6 +601,7 @@ fn capabilities_probe_is_machine_readable_and_strict() {
         "cancel-outcome",
         "terminal-replay",
         "nobuffer",
+        "forced-attach-takeover",
     ] {
         assert!(capabilities.contains(&expected), "missing {expected}");
     }
@@ -710,6 +779,521 @@ fn rejects_second_concurrent_data_attachment() {
         .unwrap();
     assert!(control.wait_with_output().unwrap().status.success());
     assert_eq!(first.wait().unwrap().code(), Some(0));
+}
+
+#[test]
+fn forced_attachment_replaces_current_without_relaunching_command() {
+    let runtime = runtime_dir("force-replace");
+    let launch_log = runtime.path().join("launches");
+    let shell = format!(
+        "printf launch >> '{}'; printf out1; printf err1 >&2; cat; printf out2; printf err2 >&2",
+        launch_log.display()
+    );
+    let mut first = attachment(runtime.path(), "force-replace", &shell);
+    let mut first_input = first.stdin.take().unwrap();
+    let mut first_output = first.stdout.take().unwrap();
+    let mut first_error = first.stderr.take().unwrap();
+    first_input.write_all(b"{}\n").unwrap();
+    first_input.flush().unwrap();
+    let header = read_json_line(&mut first_output);
+    assert_eq!(header["offsets"]["stdout"], 0);
+    let mut stdout_prefix = [0_u8; 4];
+    first_output.read_exact(&mut stdout_prefix).unwrap();
+    assert_eq!(&stdout_prefix, b"out1");
+    let mut stderr_prefix = [0_u8; 4];
+    first_error.read_exact(&mut stderr_prefix).unwrap();
+    assert_eq!(&stderr_prefix, b"err1");
+    let pid_before = pid_text(runtime.path(), "force-replace");
+
+    let mut second = forced_attachment(runtime.path(), "force-replace", "unused-on-attach");
+    let mut second_input = second.stdin.take().unwrap();
+    second_input
+        .write_all(&request(
+            serde_json::json!({"offsets":{"stdout":4,"stderr":4},"stdin_eof":3}),
+        ))
+        .unwrap();
+    second_input.write_all(b"abc").unwrap();
+    drop(second_input);
+    let second_output = second.wait_with_output().unwrap();
+
+    wait_displaced(&mut first, "displaced first");
+    drop(first_input);
+    assert_eq!(pid_text(runtime.path(), "force-replace"), pid_before);
+    assert_eq!(fs::read_to_string(&launch_log).unwrap(), "launch");
+    assert_eq!(second_output.status.code(), Some(0));
+    let (header, body) = split_header(&second_output.stdout);
+    assert_eq!(header["offsets"]["stdout"], 4);
+    assert_eq!(header["offsets"]["stderr"], 4);
+    assert_eq!(body, b"abcout2");
+    assert_eq!(second_output.stderr, b"err2");
+}
+
+#[test]
+fn forced_ahead_offset_divests_then_leaves_unattached_for_recovery() {
+    let runtime = runtime_dir("force-ahead");
+    let mut first = attachment(
+        runtime.path(),
+        "force-ahead",
+        "printf abc; printf err >&2; sleep 0.2; printf done; printf fin >&2",
+    );
+    let mut first_input = first.stdin.take().unwrap();
+    let mut first_output = first.stdout.take().unwrap();
+    let mut first_error = first.stderr.take().unwrap();
+    first_input.write_all(b"{}\n").unwrap();
+    first_input.flush().unwrap();
+    read_json_line(&mut first_output);
+    let mut stdout_prefix = [0_u8; 3];
+    first_output.read_exact(&mut stdout_prefix).unwrap();
+    assert_eq!(&stdout_prefix, b"abc");
+    let mut stderr_prefix = [0_u8; 3];
+    first_error.read_exact(&mut stderr_prefix).unwrap();
+    assert_eq!(&stderr_prefix, b"err");
+
+    let mut failed = forced_attachment(runtime.path(), "force-ahead", "unused-on-attach");
+    write_request(
+        &mut failed,
+        serde_json::json!({"offsets":{"stdout":99,"stderr":0}}),
+    );
+    let failed_output = failed.wait_with_output().unwrap();
+    assert_eq!(failed_output.status.code(), Some(1));
+    let response: serde_json::Value = serde_json::from_slice(&failed_output.stdout).unwrap();
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("requested output offset is ahead"));
+    wait_displaced(&mut first, "divested first");
+    drop(first_input);
+
+    let mut recovered = forced_attachment(runtime.path(), "force-ahead", "unused-on-attach");
+    write_request(
+        &mut recovered,
+        serde_json::json!({"offsets":{"stdout":0,"stderr":0},"stdin_eof":0}),
+    );
+    let output = recovered.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let (header, body) = split_header(&output.stdout);
+    assert_eq!(header["offsets"]["stdout"], 0);
+    assert_eq!(body, b"abcdone");
+    assert_eq!(output.stderr, b"errfin");
+}
+
+#[test]
+fn forced_invalid_stdin_eof_divests_without_mutating_stdin_state() {
+    let runtime = runtime_dir("force-stdin-eof");
+    let mut first = attachment(runtime.path(), "force-stdin-eof", "cat");
+    let mut first_input = first.stdin.take().unwrap();
+    let mut first_output = first.stdout.take().unwrap();
+    first_input.write_all(b"{}\nabc").unwrap();
+    first_input.flush().unwrap();
+    read_json_line(&mut first_output);
+    let mut echoed = [0_u8; 3];
+    first_output.read_exact(&mut echoed).unwrap();
+    assert_eq!(&echoed, b"abc");
+
+    let mut failed = forced_attachment(runtime.path(), "force-stdin-eof", "unused-on-attach");
+    write_request(
+        &mut failed,
+        serde_json::json!({"offsets":{"stdout":3,"stderr":0},"stdin_eof":2}),
+    );
+    let failed_output = failed.wait_with_output().unwrap();
+    assert_eq!(failed_output.status.code(), Some(1));
+    let response: serde_json::Value = serde_json::from_slice(&failed_output.stdout).unwrap();
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("behind accepted byte 3"));
+    wait_displaced(&mut first, "invalid eof displaced first");
+    drop(first_input);
+
+    let mut recovered = forced_attachment(runtime.path(), "force-stdin-eof", "unused-on-attach");
+    let mut input = recovered.stdin.take().unwrap();
+    input
+        .write_all(&request(
+            serde_json::json!({"offsets":{"stdout":3,"stderr":0},"stdin_eof":6}),
+        ))
+        .unwrap();
+    input.write_all(b"def").unwrap();
+    drop(input);
+    let output = recovered.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let (header, body) = split_header(&output.stdout);
+    assert_eq!(header["offsets"]["stdin"], 3);
+    assert_eq!(body, b"def");
+}
+
+#[test]
+fn forced_frontend_inconsistent_stdin_offsets_take_over_before_broker_rejects() {
+    let runtime = runtime_dir("force-frontend-stdin-range");
+    let mut first = attachment(runtime.path(), "force-frontend-stdin-range", "cat");
+    let mut first_input = first.stdin.take().unwrap();
+    let mut first_output = first.stdout.take().unwrap();
+    first_input.write_all(b"{}\nabcdef").unwrap();
+    first_input.flush().unwrap();
+    read_json_line(&mut first_output);
+    let mut echoed = [0_u8; 6];
+    first_output.read_exact(&mut echoed).unwrap();
+    assert_eq!(&echoed, b"abcdef");
+
+    let mut failed = forced_attachment(
+        runtime.path(),
+        "force-frontend-stdin-range",
+        "unused-on-attach",
+    );
+    write_request(
+        &mut failed,
+        serde_json::json!({
+            "offsets":{"stdout":6,"stderr":0},
+            "stdin_start":6,
+            "stdin_eof":5
+        }),
+    );
+    let failed_output = failed.wait_with_output().unwrap();
+    assert_eq!(failed_output.status.code(), Some(1));
+    let response: serde_json::Value = serde_json::from_slice(&failed_output.stdout).unwrap();
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap()
+            .contains("behind accepted byte 6"),
+        "response: {response}"
+    );
+    wait_displaced(&mut first, "frontend range displaced first");
+    drop(first_input);
+
+    let mut recovered = forced_attachment(
+        runtime.path(),
+        "force-frontend-stdin-range",
+        "unused-on-attach",
+    );
+    let mut recovered_input = recovered.stdin.take().unwrap();
+    recovered_input
+        .write_all(&request(serde_json::json!({
+            "offsets":{"stdout":6,"stderr":0},
+            "stdin_start":6,
+            "stdin_eof":9
+        })))
+        .unwrap();
+    recovered_input.write_all(b"ghi").unwrap();
+    drop(recovered_input);
+    let output = recovered.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let (header, body) = split_header(&output.stdout);
+    assert_eq!(header["offsets"]["stdin"], 6);
+    assert_eq!(body, b"ghi");
+}
+
+#[test]
+fn forced_nobuffer_opening_failure_divests_and_does_not_restore() {
+    let runtime = runtime_dir("force-nobuffer-gap");
+    let release = runtime.path().join("release");
+    let mut first = Command::new(binary())
+        .env("PIPEKEEP_RUNTIME_DIR", runtime.path())
+        .env("PIPEKEEP_SESSION_TTL_SECS", "30")
+        .args([
+            "--id",
+            "force-nobuffer-gap",
+            "--nobuffer",
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!(
+                "while [ ! -e '{}' ]; do sleep 0.02; done; printf abc; sleep 0.3",
+                release.display()
+            ),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first_input = first.stdin.take().unwrap();
+    let mut first_output = first.stdout.take().unwrap();
+    first_input.write_all(b"{}\n").unwrap();
+    first_input.flush().unwrap();
+    read_json_line(&mut first_output);
+    fs::write(&release, b"").unwrap();
+    let mut prefix = [0_u8; 3];
+    first_output.read_exact(&mut prefix).unwrap();
+    assert_eq!(&prefix, b"abc");
+
+    let mut failed = forced_attachment(runtime.path(), "force-nobuffer-gap", "unused-on-attach");
+    write_request(
+        &mut failed,
+        serde_json::json!({"offsets":{"stdout":99,"stderr":0}}),
+    );
+    let failed_output = failed.wait_with_output().unwrap();
+    assert_eq!(failed_output.status.code(), Some(1));
+    let response: serde_json::Value = serde_json::from_slice(&failed_output.stdout).unwrap();
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("requested output offset is ahead"));
+    wait_displaced(&mut first, "nobuffer displaced first");
+    drop(first_input);
+
+    let mut recovered = forced_attachment(runtime.path(), "force-nobuffer-gap", "unused-on-attach");
+    write_request(
+        &mut recovered,
+        serde_json::json!({"offsets":{"stdout":0,"stderr":0},"stdin_eof":0}),
+    );
+    let output = recovered.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let (header, body) = split_header(&output.stdout);
+    assert_eq!(header["nobuffer"], true);
+    assert_eq!(header["offsets"]["stdout"], 3);
+    assert_eq!(body, b"");
+}
+
+#[test]
+fn displaced_cleanup_cannot_clear_replacement() {
+    let runtime = runtime_dir("force-cleanup");
+    let mut first = attachment(runtime.path(), "force-cleanup", "cat; printf done");
+    let mut first_input = first.stdin.take().unwrap();
+    let mut first_output = first.stdout.take().unwrap();
+    first_input.write_all(b"{}\n").unwrap();
+    first_input.flush().unwrap();
+    read_json_line(&mut first_output);
+
+    let mut second = forced_attachment(runtime.path(), "force-cleanup", "unused-on-attach");
+    let mut second_input = second.stdin.take().unwrap();
+    second_input
+        .write_all(&request(
+            serde_json::json!({"offsets":{"stdout":0,"stderr":0},"stdin_eof":1}),
+        ))
+        .unwrap();
+    second_input.flush().unwrap();
+    let mut second_output = second.stdout.take().unwrap();
+    let header = read_json_line(&mut second_output);
+    assert_eq!(header["offsets"]["stdout"], 0);
+    wait_displaced(&mut first, "cleanup first");
+    drop(first_input);
+
+    second_input.write_all(b"z").unwrap();
+    drop(second_input);
+    let mut body = Vec::new();
+    second_output.read_to_end(&mut body).unwrap();
+    let status = second.wait().unwrap();
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(body, b"zdone");
+}
+
+#[test]
+fn concurrent_forced_attempts_leave_one_winner_and_no_stale_clear() {
+    let runtime = runtime_dir("force-concurrent");
+    let release = runtime.path().join("release");
+    let mut first = attachment(
+        runtime.path(),
+        "force-concurrent",
+        &format!(
+            "while [ ! -e '{}' ]; do sleep 0.02; done; printf done",
+            release.display()
+        ),
+    );
+    let mut first_input = first.stdin.take().unwrap();
+    let mut first_output = first.stdout.take().unwrap();
+    first_input.write_all(b"{}\n").unwrap();
+    first_input.flush().unwrap();
+    read_json_line(&mut first_output);
+
+    let mut second = forced_attachment(runtime.path(), "force-concurrent", "unused-on-attach");
+    write_request(
+        &mut second,
+        serde_json::json!({"offsets":{"stdout":0,"stderr":0},"stdin_eof":0}),
+    );
+    let mut second_output = second.stdout.take().unwrap();
+    let second_header = read_json_line(&mut second_output);
+    assert_eq!(second_header["offsets"]["stdout"], 0);
+    wait_displaced(&mut first, "concurrent displaced first");
+    drop(first_input);
+
+    let mut third = forced_attachment(runtime.path(), "force-concurrent", "unused-on-attach");
+    write_request(
+        &mut third,
+        serde_json::json!({"offsets":{"stdout":0,"stderr":0},"stdin_eof":0}),
+    );
+    drop(third.stdin.take());
+    let mut third_output = third.stdout.take().unwrap();
+    let third_header = read_json_line(&mut third_output);
+    assert_eq!(third_header["offsets"]["stdout"], 0);
+
+    wait_displaced(&mut second, "concurrent displaced second");
+    fs::write(&release, b"").unwrap();
+    let mut body = Vec::new();
+    third_output.read_to_end(&mut body).unwrap();
+    let third_status = third.wait().unwrap();
+    assert_eq!(third_status.code(), Some(0));
+    assert_eq!(body, b"done");
+}
+
+#[test]
+fn delayed_stdin_from_displaced_attachment_is_ignored() {
+    let runtime = runtime_dir("force-stale-stdin");
+    let mut first = attachment(runtime.path(), "force-stale-stdin", "cat");
+    let mut first_input = first.stdin.take().unwrap();
+    let mut first_output = first.stdout.take().unwrap();
+    first_input.write_all(b"{}\n").unwrap();
+    first_input.flush().unwrap();
+    read_json_line(&mut first_output);
+
+    let mut second = forced_attachment(runtime.path(), "force-stale-stdin", "unused-on-attach");
+    let mut second_input = second.stdin.take().unwrap();
+    second_input
+        .write_all(&request(
+            serde_json::json!({"offsets":{"stdout":0,"stderr":0},"stdin_eof":1}),
+        ))
+        .unwrap();
+    second_input.flush().unwrap();
+    let mut second_output = second.stdout.take().unwrap();
+    read_json_line(&mut second_output);
+    let _ = first_input.write_all(b"A");
+    second_input.write_all(b"B").unwrap();
+    drop(second_input);
+
+    let mut body = Vec::new();
+    second_output.read_to_end(&mut body).unwrap();
+    let status = second.wait().unwrap();
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(body, b"B");
+    wait_displaced(&mut first, "stale stdin first");
+}
+
+#[test]
+fn forced_replacement_during_output_preserves_contiguous_replay() {
+    let runtime = runtime_dir("force-output");
+    let mut first = attachment(
+        runtime.path(),
+        "force-output",
+        "for c in a b c d e f g h i j; do printf \"$c\"; sleep 0.02; done",
+    );
+    let mut first_input = first.stdin.take().unwrap();
+    let mut first_output = first.stdout.take().unwrap();
+    first_input.write_all(b"{}\n").unwrap();
+    first_input.flush().unwrap();
+    read_json_line(&mut first_output);
+    let mut prefix = [0_u8; 3];
+    first_output.read_exact(&mut prefix).unwrap();
+    assert_eq!(&prefix, b"abc");
+
+    let mut second = forced_attachment(runtime.path(), "force-output", "unused-on-attach");
+    write_request(
+        &mut second,
+        serde_json::json!({"offsets":{"stdout":3,"stderr":0},"stdin_eof":0}),
+    );
+    let output = second.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    wait_displaced(&mut first, "output displaced first");
+    drop(first_input);
+    let (_, body) = split_header(&output.stdout);
+    let mut combined = prefix.to_vec();
+    combined.extend_from_slice(body);
+    assert_eq!(combined, b"abcdefghij");
+}
+
+#[test]
+fn forced_replacement_after_workload_exit_replays_terminal_state() {
+    let runtime = runtime_dir("force-after-exit");
+    let mut first = attachment(
+        runtime.path(),
+        "force-after-exit",
+        "printf out; printf err >&2; exit 7",
+    );
+    first
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"stdin_eof\":0}\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut second = forced_attachment(runtime.path(), "force-after-exit", "unused-on-attach");
+    write_request(
+        &mut second,
+        serde_json::json!({"offsets":{"stdout":0,"stderr":0}}),
+    );
+    let output = second.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    let (header, body) = split_header(&output.stdout);
+    assert_eq!(header["exit"]["code"], 7);
+    assert_eq!(body, b"out");
+    assert_eq!(output.stderr, b"err");
+    let _ = first.wait();
+}
+
+#[test]
+fn malformed_forced_broker_request_does_not_take_over() {
+    let runtime = runtime_dir("force-malformed");
+    let mut first = attachment(runtime.path(), "force-malformed", "cat");
+    let mut first_input = first.stdin.take().unwrap();
+    let mut first_output = first.stdout.take().unwrap();
+    first_input.write_all(b"{}\n").unwrap();
+    first_input.flush().unwrap();
+    read_json_line(&mut first_output);
+
+    let socket = session_socket(runtime.path());
+    let mut raw = UnixStream::connect(socket).unwrap();
+    raw.write_all(b"{\"action\":\"attach\",\"force\":true,\"offsets\"\n")
+        .unwrap();
+    drop(raw);
+
+    let mut second = attachment(runtime.path(), "force-malformed", "unused-on-attach");
+    write_request(
+        &mut second,
+        serde_json::json!({"offsets":{"stdout":0,"stderr":0}}),
+    );
+    let output = second.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("already has an attached client"));
+
+    let mut control = attachment(runtime.path(), "force-malformed", "unused-on-attach");
+    control
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"action\":\"stdin-eof\",\"stdin_eof\":0}\n")
+        .unwrap();
+    assert!(control.wait_with_output().unwrap().status.success());
+    assert_eq!(first.wait().unwrap().code(), Some(0));
+    drop(first_input);
+}
+
+#[test]
+fn forced_missing_session_remains_missing() {
+    let runtime = runtime_dir("force-missing");
+    let mut child = forced_attachment(runtime.path(), "force-missing", "unused-on-attach");
+    write_request(
+        &mut child,
+        serde_json::json!({"offsets":{"stdout":0,"stderr":0}}),
+    );
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("session does not exist"));
+    assert_eq!(fs::read_dir(runtime.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn force_create_is_rejected_before_launch_or_mutation() {
+    let runtime = runtime_dir("force-create");
+    let launched = runtime.path().join("launched");
+    let shell = format!("touch '{}'", launched.display());
+    let mut child = forced_attachment(runtime.path(), "force-create", &shell);
+    write_request(&mut child, serde_json::json!({}));
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("cannot create"));
+    assert!(!launched.exists());
+    assert_eq!(fs::read_dir(runtime.path()).unwrap().count(), 0);
 }
 
 #[test]

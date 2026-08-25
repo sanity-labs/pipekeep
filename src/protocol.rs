@@ -38,6 +38,29 @@ pub struct ClientHello {
     pub stdin_start: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdin_eof: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "action", rename_all = "lowercase")]
+pub enum BrokerRequest {
+    Attach {
+        #[serde(default)]
+        offsets: OutputOffsets,
+        #[serde(default)]
+        stdin_start: u64,
+        #[serde(default)]
+        stdin_eof: Option<u64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
+    },
+    #[serde(rename = "stdin-eof")]
+    StdinEof {
+        offset: u64,
+    },
+    Pid,
+    Cancel,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

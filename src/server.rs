@@ -1,6 +1,6 @@
 use crate::protocol::{
-    read_frame, read_line, write_error_line, write_frame, write_json_line, CancelOutcome,
-    ClientAction, ClientHello, ExitResult, Frame, OutputOffsets, ServerHello,
+    read_frame, read_line, write_error_line, write_frame, write_json_line, BrokerRequest,
+    CancelOutcome, ClientAction, ClientHello, ExitResult, Frame, OutputOffsets, ServerHello,
 };
 use crate::runtime;
 use anyhow::{bail, Context, Result};
@@ -14,7 +14,14 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, Stderr, Stdin, Stdout};
 use tokio::net::UnixStream;
 
-pub async fn run(id: String, command: Vec<String>, nobuffer: bool) -> Result<i32> {
+struct AttachmentOpen {
+    offsets: OutputOffsets,
+    stdin_start: u64,
+    stdin_eof: Option<u64>,
+    force: bool,
+}
+
+pub async fn run(id: String, command: Vec<String>, nobuffer: bool, force: bool) -> Result<i32> {
     let mut input = tokio::io::stdin();
     let mut output = tokio::io::stdout();
     let line = read_line(&mut input)
@@ -31,18 +38,31 @@ pub async fn run(id: String, command: Vec<String>, nobuffer: bool) -> Result<i32
             return Ok(1);
         }
     };
+    let force = force || hello.force;
     if matches!(hello.action, Some(ClientAction::StdinEof)) {
+        if force {
+            write_error_line(&mut output, "force is only supported for data attachments").await?;
+            return Ok(1);
+        }
         let Some(offset) = hello.stdin_eof else {
             write_error_line(&mut output, "stdin-eof requires stdin_eof").await?;
             return Ok(1);
         };
         return stdin_eof_control(&id, offset, output).await;
     }
-    if hello.stdin_eof.is_some_and(|eof| eof < hello.stdin_start) {
+    let creating = hello.offsets.is_none();
+    if creating && force {
+        write_error_line(
+            &mut output,
+            "force requires attach-only offsets and cannot create a session",
+        )
+        .await?;
+        return Ok(1);
+    }
+    if !force && hello.stdin_eof.is_some_and(|eof| eof < hello.stdin_start) {
         write_error_line(&mut output, "stdin_eof is before stdin_start").await?;
         return Ok(1);
     }
-    let creating = hello.offsets.is_none();
     let offsets = hello.offsets.unwrap_or_default();
     let session_dir = runtime::session_dir(&id)?;
 
@@ -69,9 +89,12 @@ pub async fn run(id: String, command: Vec<String>, nobuffer: bool) -> Result<i32
         output,
         tokio::io::stderr(),
         connection,
-        offsets,
-        hello.stdin_start,
-        hello.stdin_eof,
+        AttachmentOpen {
+            offsets,
+            stdin_start: hello.stdin_start,
+            stdin_eof: hello.stdin_eof,
+            force,
+        },
     )
     .await
 }
@@ -175,18 +198,16 @@ async fn proxy_attachment(
     mut external_output: Stdout,
     external_error: Stderr,
     mut broker: UnixStream,
-    offsets: OutputOffsets,
-    stdin_start: u64,
-    stdin_eof: Option<u64>,
+    opening: AttachmentOpen,
 ) -> Result<i32> {
     write_json_line(
         &mut broker,
-        &serde_json::json!({
-            "action": "attach",
-            "offsets": offsets,
-            "stdin_start": stdin_start,
-            "stdin_eof": stdin_eof,
-        }),
+        &BrokerRequest::Attach {
+            offsets: opening.offsets,
+            stdin_start: opening.stdin_start,
+            stdin_eof: opening.stdin_eof,
+            force: opening.force,
+        },
     )
     .await?;
 
@@ -218,7 +239,7 @@ async fn proxy_attachment(
         external_error,
         broker,
         hello,
-        stdin_eof,
+        opening.stdin_eof,
     )
     .await
     .unwrap_or(1))
@@ -357,11 +378,7 @@ async fn stdin_eof_control(id: &str, offset: u64, mut output: Stdout) -> Result<
             return Ok(1);
         }
     };
-    write_json_line(
-        &mut connection,
-        &serde_json::json!({"action": "stdin-eof", "offset": offset}),
-    )
-    .await?;
+    write_json_line(&mut connection, &BrokerRequest::StdinEof { offset }).await?;
     let response = read_line(&mut connection)
         .await?
         .context("broker closed before its stdin EOF response")?;
@@ -421,7 +438,12 @@ pub async fn cancel(id: &str) -> Result<i32> {
 async fn control_request(id: &str, action: &str) -> Result<serde_json::Value> {
     let session_dir = runtime::session_dir(id)?;
     let mut connection = connect_existing(&session_dir).await?;
-    write_json_line(&mut connection, &serde_json::json!({"action": action})).await?;
+    let request = match action {
+        "pid" => BrokerRequest::Pid,
+        "cancel" => BrokerRequest::Cancel,
+        _ => bail!("unsupported control request {action:?}"),
+    };
+    write_json_line(&mut connection, &request).await?;
     let line = read_line(&mut connection)
         .await?
         .context("broker closed before its control response")?;
