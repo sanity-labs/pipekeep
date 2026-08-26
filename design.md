@@ -54,7 +54,7 @@ or the pod is replaced.
 ```text
 Usage:
   pipekeep [--] TRANSPORT [ARG...]
-  pipekeep --id ID [--nobuffer] -- COMMAND [ARG...]
+  pipekeep --id ID [--nobuffer] [--force] -- COMMAND [ARG...]
   pipekeep cancel --id ID
   pipekeep pid --id ID
 
@@ -66,7 +66,7 @@ Modes:
   pipekeep --id ID -- COMMAND ...
       Create session ID and run COMMAND, or attach to that session when the
       opening protocol message requests a resume. Only one client may be
-      attached at a time.
+      attached at a time unless an attach-only request is forced.
 
   pipekeep cancel --id ID
       Request graceful termination, escalate if necessary, wait until the
@@ -86,6 +86,11 @@ Options:
       64 KiB rolling stdin tail; the inner form keeps no disconnected output
       backlog. Counters still advance and the protocol still reports offsets,
       and bytes no longer retained are omitted at the next reattachment.
+
+  --force
+      With --id, supersede the current data attachment for an attach-only
+      opening request. It is rejected for session creation and control
+      requests.
 ```
 
 The transport command is deliberately unspecified. It can be `kubectl exec`,
@@ -129,10 +134,17 @@ invocation that created the session. Later attachments and `cancel`
 invocations cannot change them; set them in the environment of the
 session-creating remote invocation.
 
-A session has at most one attached data client. A second data attachment is
-rejected, although idempotent control requests such as an EOF declaration may
-run alongside it. This avoids ambiguous stdin ownership and
-output-consumption rules.
+A session has at most one attached data client. A second non-forced data
+attachment is rejected, although idempotent control requests such as an EOF
+declaration may run alongside it. A forced attach-only request that reaches an
+existing broker immediately installs a fresh broker-local attachment
+generation, cancels the previous generation, and only then validates offsets,
+replay availability, no-buffer constraints, stdin position, sticky EOF, and
+the opening snapshot. If one of those post-takeover checks fails, the broker
+returns a hard opening error and compare-clears that failed generation if it
+is still current. The superseded frontend is never restored; the command,
+process group, broker buffers and offsets, stdin state, sticky EOF, retained
+terminal state, and cancellation facts remain broker-owned state.
 
 The broker records absolute byte positions for all three streams. Position
 `N` means that `N` bytes precede the next byte. Positions begin at zero and
@@ -174,6 +186,15 @@ A client that has already observed local stdin EOF includes its absolute end:
 
 ```json
 {"offsets":{"stdout":12312,"stderr":131},"stdin_eof":2048}
+```
+
+A client or session-server invocation that intentionally takes over a current
+data attachment marks an attach-only request as forced. Force is meaningful
+only when output offsets are present; create plus force is rejected before a
+broker is started, and a missing broker/session remains missing:
+
+```json
+{"offsets":{"stdout":12312,"stderr":131},"force":true}
 ```
 
 If stdin EOF is discovered during an attachment, the client makes a separate

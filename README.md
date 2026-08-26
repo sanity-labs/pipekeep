@@ -34,7 +34,7 @@ order), with user-only permissions.
 
 ```text
 pipekeep [--nobuffer] [--] TRANSPORT [ARG...]
-pipekeep --id ID [--nobuffer] -- COMMAND [ARG...]
+pipekeep --id ID [--nobuffer] [--force] -- COMMAND [ARG...]
 pipekeep cancel --id ID
 pipekeep pid --id ID
 pipekeep capabilities --json
@@ -62,20 +62,30 @@ the window advances. Absolute offsets expose any range no longer retained at
 the next reattachment. Apply `--nobuffer` to both the outer and inner
 invocation when input should also use bounded-window semantics.
 
+With `--id`, `--force` applies only to attach-only opening requests, meaning
+requests that include output `offsets`. It cannot create a session. A forced
+attach to an existing broker immediately supersedes the current data
+attachment without restarting or signaling the command; if later opening
+checks fail, that failed generation is cleared and the broker is left
+unattached.
+
 ## Compatibility probe
 
 `pipekeep capabilities --json` prints one compact JSON line an upper layer can
 use to verify it is talking to a compatible binary:
 
 ```json
-{"capabilities":["raw-public-streams","absolute-resume-offsets","sticky-stdin-eof","separate-stdout-stderr","process-group-cancel","cancel-outcome","terminal-replay","nobuffer"],"name":"pipekeep","protocol":1,"revision":"<source revision>","version":"0.1.0"}
+{"capabilities":["raw-public-streams","absolute-resume-offsets","sticky-stdin-eof","separate-stdout-stderr","process-group-cancel","cancel-outcome","terminal-replay","nobuffer","forced-attach-takeover"],"name":"pipekeep","protocol":1,"revision":"<source revision>","version":"0.1.0"}
 ```
 
 `protocol` is the attachment protocol version described below. `revision` is
 the build's source revision: exact builds set `PIPEKEEP_BUILD_REV` at compile
 time, a Git checkout falls back to its current commit, and `unknown` is used
 when neither is available. `pipekeep --version` reports the same revision.
-Any other `capabilities` invocation is rejected with an error.
+The advertised capabilities describe the invoked binary; an already-running
+older broker may ignore the additive `force` field and safely degrade to normal
+attachment contention instead of takeover. Any other `capabilities` invocation
+is rejected with an error.
 
 ## Attachment protocol
 
