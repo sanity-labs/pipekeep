@@ -13,6 +13,7 @@ pub enum Mode {
         nobuffer: bool,
         force: bool,
         group_pidfd: bool,
+        framed: bool,
     },
     Cancel {
         id: String,
@@ -56,6 +57,7 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
     let mut nobuffer = false;
     let mut force = false;
     let mut group_pidfd = false;
+    let mut framed = false;
     let index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -75,6 +77,16 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
                 group_pidfd = true;
                 args.remove(index);
             }
+            "--framed" => {
+                // Old parsers interpret an unknown leading token as an outer
+                // transport command. Require the strict server-option context
+                // so every valid framed invocation is rejected by old parsers.
+                if id.is_none() {
+                    bail!("--framed must follow --id ID");
+                }
+                framed = true;
+                args.remove(index);
+            }
             "--force" => {
                 force = true;
                 args.remove(index);
@@ -88,6 +100,9 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
         }
     }
 
+    if framed && (nobuffer || id.is_none()) {
+        bail!("--framed requires --id and buffered sessions (no --nobuffer)");
+    }
     if args.is_empty() {
         bail!("a command is required");
     }
@@ -98,6 +113,7 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
             nobuffer,
             force,
             group_pidfd,
+            framed,
         })
     } else {
         if group_pidfd {
@@ -200,7 +216,7 @@ pub const HELP: &str = r#"pipekeep: resumable process pipes
 
 Usage:
   pipekeep [--nobuffer] [--] TRANSPORT [ARG...]
-  pipekeep --id ID [--nobuffer] [--force] [--group-pidfd] -- COMMAND [ARG...]
+  pipekeep --id ID [--nobuffer] [--force] [--group-pidfd] [--framed] -- COMMAND [ARG...]
   pipekeep cancel --id ID [--require-group-pidfd]
   pipekeep session --id ID
   pipekeep pid --id ID
@@ -211,12 +227,25 @@ The outer form reruns TRANSPORT after a disconnection. The --id form creates
 or attaches to a detached process session using the opening protocol message.
 With --id, --force applies only to attach-only opening requests and supersedes
 an existing data attachment without restarting the command.
+--framed requires buffering and carries typed frames after a versioned opening.
 `capabilities --json` prints a machine-readable compatibility probe.
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framed_requires_strict_server_option_context_and_buffering() {
+        let args = |values: &[&str]| values.iter().map(|value| (*value).to_owned()).collect();
+        assert!(matches!(
+            parse(args(&["--id", "x", "--framed", "--", "cat"])).unwrap(),
+            Mode::Server { framed: true, .. }
+        ));
+        assert!(parse(args(&["--framed", "--id", "x", "--", "cat"])).is_err());
+        assert!(parse(args(&["--id", "x", "--framed", "--nobuffer", "--", "cat"])).is_err());
+        assert!(parse(args(&["--id", "x", "--nobuffer", "--framed", "--", "cat"])).is_err());
+    }
 
     #[test]
     fn parses_outer_and_server() {

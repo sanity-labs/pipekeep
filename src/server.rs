@@ -1,6 +1,7 @@
 use crate::protocol::{
-    read_frame, read_line, write_error_line, write_frame, write_json_line, BrokerRequest,
-    CancelOutcome, ClientAction, ClientHello, ExitResult, Frame, OutputOffsets, ServerHello,
+    checked_end, read_frame, read_line, write_error_line, write_frame, write_json_line,
+    BrokerRequest, CancelOutcome, ClientAction, ClientHello, Direction, ExitResult, Frame,
+    OutputOffsets, ServerHello, FRAMED_ATTACHMENT_V1,
 };
 use crate::runtime;
 use anyhow::{bail, Context, Result};
@@ -19,6 +20,7 @@ struct AttachmentOpen {
     stdin_start: u64,
     stdin_eof: Option<u64>,
     force: bool,
+    framed: bool,
 }
 
 pub async fn run(
@@ -27,6 +29,7 @@ pub async fn run(
     nobuffer: bool,
     force: bool,
     group_pidfd: bool,
+    framed: bool,
 ) -> Result<i32> {
     let mut input = tokio::io::stdin();
     let mut output = tokio::io::stdout();
@@ -49,6 +52,14 @@ pub async fn run(
         write_error_line(
             &mut output,
             "--group-pidfd is only for new sessions; existing sessions cannot be retrofitted",
+        )
+        .await?;
+        return Ok(1);
+    }
+    if framed && hello.action.is_some() {
+        write_error_line(
+            &mut output,
+            "--framed is for data attachments; use the ordinary EOF control",
         )
         .await?;
         return Ok(1);
@@ -108,6 +119,7 @@ pub async fn run(
             stdin_start: hello.stdin_start,
             stdin_eof: hello.stdin_eof,
             force,
+            framed,
         },
     )
     .await
@@ -239,16 +251,22 @@ async fn proxy_attachment(
     mut broker: UnixStream,
     opening: AttachmentOpen,
 ) -> Result<i32> {
-    write_json_line(
-        &mut broker,
-        &BrokerRequest::Attach {
+    let request = if opening.framed {
+        BrokerRequest::AttachFramedV1 {
             offsets: opening.offsets,
             stdin_start: opening.stdin_start,
             stdin_eof: opening.stdin_eof,
             force: opening.force,
-        },
-    )
-    .await?;
+        }
+    } else {
+        BrokerRequest::Attach {
+            offsets: opening.offsets,
+            stdin_start: opening.stdin_start,
+            stdin_eof: opening.stdin_eof,
+            force: opening.force,
+        }
+    };
+    write_json_line(&mut broker, &request).await?;
 
     let response = read_line(&mut broker)
         .await?
@@ -265,13 +283,23 @@ async fn proxy_attachment(
     }
     let hello: ServerHello = serde_json::from_slice(&response)
         .context("broker returned an invalid attachment header")?;
+    if opening.framed
+        && (hello.attachment.as_deref() != Some(FRAMED_ATTACHMENT_V1) || hello.nobuffer)
+    {
+        bail!(
+            "broker did not confirm buffered framed-v1 attachment; no fallback; session retained"
+        );
+    }
+    if opening.framed {
+        if let Some(exit) = &hello.exit {
+            exit.validate()?;
+        }
+    }
     write_json_line(&mut external_output, &hello).await?;
 
-    // After the handshake, stdout and stderr belong to the command. A
-    // pipekeep diagnostic written to either stream would be counted by the
-    // public client as delivered command bytes and poison its resume offsets,
-    // so an internal failure closes the attachment silently; the client sees
-    // the transport end and reattaches at real byte positions.
+    // After the handshake, raw streams belong to the command and framed
+    // stdout belongs to the encoder. Never inject diagnostics into either
+    // wire format: failure detaches, and clients recover the same session.
     Ok(relay_streams(
         external_input,
         external_output,
@@ -279,6 +307,7 @@ async fn proxy_attachment(
         broker,
         hello,
         opening.stdin_eof,
+        opening.framed,
     )
     .await
     .unwrap_or(1))
@@ -291,63 +320,87 @@ async fn relay_streams(
     broker: UnixStream,
     hello: ServerHello,
     stdin_eof: Option<u64>,
+    framed: bool,
 ) -> Result<i32> {
-    let stdin_position = hello.offsets.stdin;
-    let stdin_already_eof = hello.stdin_eof;
+    let mut stdin_position = hello.offsets.stdin;
     let mut stdout_position = hello.offsets.stdout;
     let mut stderr_position = hello.offsets.stderr;
     let (mut broker_read, mut broker_write) = broker.into_split();
-    let mut input = tokio::spawn(async move {
-        let result = forward_raw_stdin(
-            external_input,
-            &mut broker_write,
-            stdin_position,
-            stdin_eof,
-            stdin_already_eof,
-        )
-        .await;
-        let _ = broker_write.shutdown().await;
-        result
-    });
-    loop {
-        tokio::select! {
-            result = &mut input => {
-                result??;
-                return Ok(0);
+    // Both futures live in this scope. On ANY completion or error their
+    // pending reads/writes are dropped; there is no detached forwarding task.
+    let input = async {
+        if framed {
+            let mut input = external_input;
+            while let Some(frame) = read_frame(&mut input, Direction::Input).await? {
+                write_frame(&mut broker_write, &frame).await?;
             }
-            frame = read_frame(&mut broker_read) => {
-                match frame? {
-                    Some(Frame::StdoutData { offset, data }) => {
-                        write_raw_output(
-                            &mut external_output,
-                            &mut stdout_position,
-                            offset,
-                            &data,
-                        ).await?;
+            Ok(1) // transport end only; never synthesize a StdinEof frame
+        } else {
+            forward_raw_stdin(
+                external_input,
+                &mut broker_write,
+                hello.offsets.stdin,
+                stdin_eof,
+                hello.stdin_eof,
+            )
+            .await?;
+            Ok(0)
+        }
+    };
+    let output = async {
+        loop {
+            let Some(frame) = read_frame(&mut broker_read, Direction::Output).await? else {
+                return Ok(if framed { 1 } else { 0 });
+            };
+            if framed {
+                match &frame {
+                    Frame::StdoutData { offset, data } | Frame::StderrData { offset, data } => {
+                        let position = if matches!(&frame, Frame::StdoutData { .. }) {
+                            &mut stdout_position
+                        } else {
+                            &mut stderr_position
+                        };
+                        if *offset != *position {
+                            bail!("broker output is not contiguous");
+                        }
+                        *position = checked_end(*offset, data.len())?;
                     }
-                    Some(Frame::StderrData { offset, data }) => {
-                        write_raw_output(
-                            &mut external_error,
-                            &mut stderr_position,
-                            offset,
-                            &data,
-                        ).await?;
+                    Frame::StdinPosition { offset } => {
+                        if *offset < stdin_position {
+                            bail!("broker stdin receipt regressed");
+                        }
+                        stdin_position = *offset;
                     }
-                    Some(Frame::StdinPosition { .. }) => {}
-                    Some(Frame::Exit(result)) => {
-                        input.abort();
+                    _ => {}
+                }
+                write_frame(&mut external_output, &frame).await?;
+                if let Frame::Exit(result) = frame {
+                    return Ok(result.process_code());
+                }
+            } else {
+                match frame {
+                    Frame::StdoutData { offset, data } => {
+                        write_raw_output(&mut external_output, &mut stdout_position, offset, &data)
+                            .await?;
+                    }
+                    Frame::StderrData { offset, data } => {
+                        write_raw_output(&mut external_error, &mut stderr_position, offset, &data)
+                            .await?;
+                    }
+                    Frame::StdinPosition { .. } => {}
+                    Frame::Exit(result) => {
                         external_output.flush().await?;
                         external_error.flush().await?;
                         return Ok(result.process_code());
                     }
-                    Some(_) => bail!("broker sent a client-to-server frame"),
-                    None => {
-                        input.abort();
-                        return Ok(0);
-                    }
+                    _ => bail!("broker sent a client-to-server frame"),
                 }
             }
         }
+    };
+    tokio::select! {
+        result = input => result,
+        result = output => result,
     }
 }
 
@@ -370,7 +423,7 @@ async fn forward_raw_stdin<W: AsyncWrite + Unpin>(
             return std::future::pending::<Result<()>>().await;
         }
         let limit = eof
-            .map(|end| (end - position) as usize)
+            .map(|end| (end - position).min(buffer.len() as u64) as usize)
             .unwrap_or(buffer.len())
             .min(buffer.len());
         let count = input.read(&mut buffer[..limit]).await?;
@@ -385,7 +438,7 @@ async fn forward_raw_stdin<W: AsyncWrite + Unpin>(
             },
         )
         .await?;
-        position += count as u64;
+        position = checked_end(position, count)?;
     }
 }
 
@@ -398,13 +451,13 @@ async fn write_raw_output<W: AsyncWrite + Unpin>(
     if offset > *position {
         bail!("broker output contains a gap at byte {position}");
     }
-    let skip = position.saturating_sub(offset) as usize;
+    let skip = usize::try_from(position.saturating_sub(offset)).unwrap_or(usize::MAX);
     if skip >= data.len() {
         return Ok(());
     }
     output.write_all(&data[skip..]).await?;
     output.flush().await?;
-    *position += (data.len() - skip) as u64;
+    *position = checked_end(*position, data.len() - skip)?;
     Ok(())
 }
 

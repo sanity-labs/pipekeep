@@ -34,7 +34,7 @@ order), with user-only permissions.
 
 ```text
 pipekeep [--nobuffer] [--] TRANSPORT [ARG...]
-pipekeep --id ID [--nobuffer] [--force] -- COMMAND [ARG...]
+pipekeep --id ID [--nobuffer] [--force] [--framed] -- COMMAND [ARG...]
 pipekeep cancel --id ID
 pipekeep pid --id ID
 pipekeep capabilities --json
@@ -178,7 +178,7 @@ unattached.
 use to verify it is talking to a compatible binary:
 
 ```json
-{"capabilities":["raw-public-streams","absolute-resume-offsets","sticky-stdin-eof","separate-stdout-stderr","process-group-cancel","cancel-outcome","opt-in-group-pidfd-cancel-v1","terminal-replay","nobuffer","forced-attach-takeover"],"name":"pipekeep","protocol":1,"revision":"<source revision>","version":"0.1.0"}
+{"capabilities":["raw-public-streams","framed-v1","absolute-resume-offsets","sticky-stdin-eof","separate-stdout-stderr","process-group-cancel","cancel-outcome","opt-in-group-pidfd-cancel-v1","terminal-replay","nobuffer","forced-attach-takeover"],"name":"pipekeep","protocol":1,"revision":"<source revision>","version":"0.1.0"}
 ```
 
 `protocol` is the attachment protocol version described below. `revision` is
@@ -193,9 +193,10 @@ is rejected with an error.
 ## Attachment protocol
 
 Each attachment starts with one newline-terminated JSON request on stdin and
-one newline-terminated JSON response on stdout. Everything after the response
-is transported as ordinary raw stdin, stdout, and stderr. SSH and Kubernetes
-Exec preserve those streams; no data framing is exposed to clients.
+one newline-terminated JSON response on stdout. In the default raw mode,
+everything after the response is ordinary raw stdin, stdout, and stderr. SSH
+and Kubernetes Exec preserve those streams. Explicit `--framed` attachments
+use the binary format below; the outer transport form continues to use raw mode.
 
 On reconnect, the client reports the next stdout and stderr bytes it wants:
 
@@ -215,6 +216,94 @@ is the absolute input end; `stdin_eof: true` in a response confirms that the
 broker has reached it. Response values `stdout_eof` and `stderr_eof` are the
 absolute output ends. A retained `exit` contains either `code` or `signal`.
 See [design.md](design.md) for the complete reconnection rules.
+
+## Public framed attachments
+
+`pipekeep --id ID --framed -- COMMAND [ARG...]` uses the same create/attach JSON
+request and absolute resume offsets, followed by typed binary frames in both
+directions. Put `--framed` after `--id ID`: this strict server-option context
+ensures old frontends reject it as an option rather than interpreting it as an
+outer transport command. It requires buffered sessions. `--framed --nobuffer` fails before
+launch, and a framed attachment to an existing nobuffer broker fails before
+forced replacement or stdin/EOF changes. `--framed` is not an outer-form option.
+
+The actual broker must accept the distinct `attach-framed-v1` request and return
+`"attachment":"framed-v1"` in its opening. The public frontend verifies that
+marker and buffering before forwarding any input frames or successful opening:
+
+```json
+{"attachment":"framed-v1","offsets":{"stdin":942,"stdout":12312,"stderr":131}}
+```
+
+A new broker can frame an attachment to its existing raw-created session without
+launching the command again. An old running broker rejects the distinct action
+before takeover or stdin mutation; a new frontend cannot upgrade that broker.
+Old frontends reject `--framed` as an unknown server option before creation.
+There is no fallback or retry creation after dispatch. A capability listing is
+only a binary description; the broker opening is authoritative.
+
+Frames reuse the broker encoding: one type byte, a four-byte unsigned big-endian
+payload length, then the payload. Data payloads start with an eight-byte unsigned
+big-endian absolute offset; all remaining bytes are workload bytes.
+
+| Type | Direction | Payload |
+| --- | --- | --- |
+| 1 | Caller → broker | stdin offset + data |
+| 2 | Caller → broker | stdin EOF offset, exactly 8 bytes |
+| 3 | Broker → caller | stdout offset + data |
+| 4 | Broker → caller | stderr offset + data |
+| 5 | Broker → caller | stdin position, exactly 8 bytes |
+| 6 | Broker → caller | retained exit JSON, e.g. `{"code":23}` or `{"signal":15}` |
+
+The existing 16 MiB payload ceiling remains (at most 16 MiB minus 8 data bytes
+per frame); exit payloads are limited to 256 bytes. Type, direction and length
+are checked before payload allocation; offset addition is checked for overflow.
+Use small input frames and a bounded replay window, e.g. 4 KiB frames and 64 KiB
+of unreceipted input. A caller retains bytes from the last receipt through its
+sent position, stops sending when that window is full, and continues reading
+both outputs and receipts. On reconnect, discard through the broker's opening
+stdin position and replay the remaining bytes with their original offsets.
+Output resume positions count only fully received workload data bytes separately
+for stdout and stderr. Framing/header bytes never advance stream offsets.
+
+Receipts are continuous, monotonic positions actually written to child stdin,
+including partial writes. They do not acknowledge application consumption,
+JSONL messages, durable storage, or recovery across broker loss. Intermediate
+positions may coalesce: each attachment retains one latest `u64` in a watch
+channel, not a receipt queue. A sender services at most one receipt before an
+output/terminal turn and alternates ready stdout/stderr. Slow readers still
+apply transport backpressure; coalescing bounds receipt storage, not latency.
+
+Only an explicit valid EOF frame, opening `stdin_eof`, or independent ordinary
+`stdin-eof` control declares sticky EOF intent. A framed opening additionally
+reports `stdin_eof_at` whenever intent is known, including future EOF not yet
+reached. A lost EOF response never allows input to reopen. Input after reached
+EOF, gaps, data beyond declared EOF, invalid frames and truncated transport
+detach the attachment. Transport closure never cancels the command or invents
+stdin EOF/command exit. On any proxy failure its input forwarding is dropped;
+the broker owns ongoing work and retained actual exit and replay tails.
+To continue observing the same attachment after sending a workload EOF frame,
+keep public stdin open until the retained Exit frame arrives. Closing public
+stdin instead detaches the transport, even after an EOF frame; recover the same
+session rather than assuming a terminal result.
+After forced takeover, discard the old transport. A frame already in that
+transport can finish or tear, but its generation cannot start new input/EOF
+mutations or publish a receipt into the replacement attachment.
+A torn terminal frame is not a command terminal result: reconnect to the same
+session. The process exit code alone is not an authoritative terminal frame.
+
+Framed public stderr carries no workload bytes; workload stderr is type 4 on
+public stdout. Raw mode and its stderr/replay behavior remain compatible, with
+no public continuous receipts. Raw outer stdin replay and buffered output spool
+remain unbounded. Choosing framed mode lets a custom caller bound pending stdin;
+it does not establish finite output storage or complete buffering acceptance.
+Cancellation, output EOF, command exit and original-group settlement retain their
+existing distinct meanings and cancellation implementation.
+
+The Linux public matrix runs with `cargo test --test receipts -- --nocapture`.
+It requires Python 3 and pidfds. To require actual old-peer coverage, set
+`PIPEKEEP_REQUIRE_RECEIPTS_OLD=1` and `PIPEKEEP_RECEIPTS_OLD_BINARY` to a separate
+build of accepted revision `2f1329f8ceef95ac97ee4d2ba72955beb321e1ab`.
 
 ## Runtime tuning
 
