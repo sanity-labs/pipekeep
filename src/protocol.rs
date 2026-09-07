@@ -16,6 +16,8 @@ pub struct SessionFact {
     pub cancel_error: Option<String>,
 }
 
+pub const FRAMED_ATTACHMENT_V1: &str = "framed-v1";
+
 pub const MAX_JSON_LINE: usize = 64 * 1024;
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
@@ -65,6 +67,18 @@ pub enum BrokerRequest {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         force: bool,
     },
+    // A distinct action makes old brokers reject before installing a lease.
+    #[serde(rename = "attach-framed-v1")]
+    AttachFramedV1 {
+        #[serde(default)]
+        offsets: OutputOffsets,
+        #[serde(default)]
+        stdin_start: u64,
+        #[serde(default)]
+        stdin_eof: Option<u64>,
+        #[serde(default)]
+        force: bool,
+    },
     #[serde(rename = "stdin-eof")]
     StdinEof {
         offset: u64,
@@ -80,6 +94,10 @@ pub enum BrokerRequest {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerHello {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin_eof_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionFact>,
     pub offsets: AllOffsets,
@@ -115,6 +133,13 @@ pub enum CancelOutcome {
 }
 
 impl ExitResult {
+    pub fn validate(&self) -> Result<()> {
+        match (self.code, self.signal) {
+            (Some(0..=255), None) | (None, Some(1..=127)) => Ok(()),
+            _ => bail!("exit frame must contain one actual code or signal"),
+        }
+    }
+
     #[cfg(unix)]
     pub fn from_status(status: std::process::ExitStatus) -> Self {
         use std::os::unix::process::ExitStatusExt;
@@ -178,10 +203,10 @@ pub async fn write_error_line<W: AsyncWrite + Unpin>(writer: &mut W, error: &str
 
 pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -> Result<()> {
     let (kind, payload) = match frame {
-        Frame::StdinData { offset, data } => (1, offset_payload(*offset, data)),
+        Frame::StdinData { offset, data } => (1, offset_payload(*offset, data)?),
         Frame::StdinEof { offset } => (2, offset.to_be_bytes().to_vec()),
-        Frame::StdoutData { offset, data } => (3, offset_payload(*offset, data)),
-        Frame::StderrData { offset, data } => (4, offset_payload(*offset, data)),
+        Frame::StdoutData { offset, data } => (3, offset_payload(*offset, data)?),
+        Frame::StderrData { offset, data } => (4, offset_payload(*offset, data)?),
         Frame::StdinPosition { offset } => (5, offset.to_be_bytes().to_vec()),
         Frame::Exit(result) => (6, serde_json::to_vec(result)?),
     };
@@ -197,7 +222,42 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
     Ok(())
 }
 
-pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Frame>> {
+#[derive(Clone, Copy)]
+pub enum Direction {
+    Input,
+    Output,
+}
+
+pub fn checked_end(offset: u64, length: usize) -> Result<u64> {
+    offset
+        .checked_add(u64::try_from(length)?)
+        .context("frame position overflowed")
+}
+
+fn validate_header(kind: u8, length: usize, direction: Direction) -> Result<()> {
+    let allowed = match direction {
+        Direction::Input => matches!(kind, 1 | 2),
+        Direction::Output => matches!(kind, 3..=6),
+    };
+    if !allowed {
+        bail!("frame has invalid direction or type");
+    }
+    let valid = match kind {
+        1 | 3 | 4 => (8..=MAX_FRAME).contains(&length),
+        2 | 5 => length == 8,
+        6 => (1..=256).contains(&length),
+        _ => false,
+    };
+    if !valid {
+        bail!("frame has invalid length or exceeds the size limit");
+    }
+    Ok(())
+}
+
+pub async fn read_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    direction: Direction,
+) -> Result<Option<Frame>> {
     let mut header = [0_u8; 5];
     let first = reader.read(&mut header[..1]).await?;
     if first == 0 {
@@ -205,9 +265,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<F
     }
     reader.read_exact(&mut header[1..]).await?;
     let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
-    if length > MAX_FRAME {
-        bail!("received frame exceeds the size limit");
-    }
+    validate_header(header[0], length, direction)?;
     let mut payload = vec![0_u8; length];
     reader.read_exact(&mut payload).await?;
     let frame = match header[0] {
@@ -229,17 +287,27 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<F
         5 => Frame::StdinPosition {
             offset: only_offset(&payload)?,
         },
-        6 => Frame::Exit(serde_json::from_slice(&payload).context("invalid exit frame payload")?),
+        6 => {
+            let result: ExitResult =
+                serde_json::from_slice(&payload).context("invalid exit frame payload")?;
+            result.validate()?;
+            Frame::Exit(result)
+        }
         other => bail!("unknown frame type {other}"),
     };
     Ok(Some(frame))
 }
 
-fn offset_payload(offset: u64, data: &[u8]) -> Vec<u8> {
+fn offset_payload(offset: u64, data: &[u8]) -> Result<Vec<u8>> {
+    // Check before the payload allocation, including for locally produced frames.
+    if data.len() > MAX_FRAME - 8 {
+        bail!("frame is too large");
+    }
+    checked_end(offset, data.len())?;
     let mut payload = Vec::with_capacity(8 + data.len());
     payload.extend_from_slice(&offset.to_be_bytes());
     payload.extend_from_slice(data);
-    payload
+    Ok(payload)
 }
 
 fn only_offset(payload: &[u8]) -> Result<u64> {
@@ -254,12 +322,74 @@ fn split_offset(payload: Vec<u8>) -> Result<(u64, Vec<u8>)> {
         bail!("data frame has an invalid length");
     }
     let offset = u64::from_be_bytes(payload[..8].try_into().unwrap());
+    checked_end(offset, payload.len() - 8)?;
     Ok((offset, payload[8..].to_vec()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_limits_and_checked_ranges() {
+        for kind in [1, 3, 4] {
+            let direction = if kind == 1 {
+                Direction::Input
+            } else {
+                Direction::Output
+            };
+            assert!(validate_header(kind, 8, direction).is_ok());
+            assert!(validate_header(kind, MAX_FRAME, direction).is_ok());
+            assert!(validate_header(kind, MAX_FRAME + 1, direction).is_err());
+            assert!(validate_header(kind, 7, direction).is_err());
+        }
+        assert!(validate_header(2, 9, Direction::Input).is_err());
+        assert!(validate_header(5, 9, Direction::Output).is_err());
+        assert!(validate_header(6, 257, Direction::Output).is_err());
+        assert!(validate_header(3, MAX_FRAME, Direction::Input).is_err());
+        assert_eq!(checked_end(u64::MAX - 4, 4).unwrap(), u64::MAX);
+        assert!(checked_end(u64::MAX - 4, 5).is_err());
+        assert!(offset_payload(u64::MAX, b"x").is_err());
+        for (code, signal) in [
+            (None, None),
+            (Some(0), Some(15)),
+            (Some(-1), None),
+            (None, Some(0)),
+            (None, Some(i32::MAX)),
+        ] {
+            assert!(ExitResult { code, signal }.validate().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_headers_without_reading_or_allocating_payload() {
+        for (kind, length) in [(1, u32::MAX), (3, 16 * 1024 * 1024), (2, 9), (99, 1)] {
+            let mut bytes = vec![kind];
+            bytes.extend_from_slice(&length.to_be_bytes());
+            // Writer stays open with no payload: timeout would mean the
+            // decoder trusted the header enough to allocate/read its body.
+            let (mut writer, mut reader) = tokio::io::duplex(5);
+            writer.write_all(&bytes).await.unwrap();
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                read_frame(&mut reader, Direction::Input)
+            )
+            .await
+            .unwrap()
+            .is_err());
+        }
+        for bytes in [vec![1], vec![1, 0, 0, 0, 9, 0, 0], vec![2, 0, 0, 0, 8, 0]] {
+            assert!(read_frame(&mut bytes.as_slice(), Direction::Input)
+                .await
+                .is_err());
+        }
+        let mut bytes = vec![1, 0, 0, 0, 9];
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        bytes.push(1);
+        assert!(read_frame(&mut bytes.as_slice(), Direction::Input)
+            .await
+            .is_err());
+    }
 
     #[tokio::test]
     async fn frames_round_trip() {
@@ -275,7 +405,10 @@ mod tests {
             .await
             .unwrap();
         });
-        let frame = read_frame(&mut right).await.unwrap().unwrap();
+        let frame = read_frame(&mut right, Direction::Output)
+            .await
+            .unwrap()
+            .unwrap();
         write.await.unwrap();
         match frame {
             Frame::StdoutData { offset, data } => {

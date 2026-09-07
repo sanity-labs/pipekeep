@@ -1,8 +1,9 @@
 use crate::cancellation::Cancellation;
 use crate::group_pidfd::{GroupPidfd, GroupSignal};
 use crate::protocol::{
-    read_frame, read_line, write_error_line, write_frame, write_json_line, AllOffsets,
-    BrokerRequest, CancelOutcome, ExitResult, Frame, OutputOffsets, ServerHello,
+    checked_end, read_frame, read_line, write_error_line, write_frame, write_json_line, AllOffsets,
+    BrokerRequest, CancelOutcome, Direction, ExitResult, Frame, OutputOffsets, ServerHello,
+    FRAMED_ATTACHMENT_V1,
 };
 use crate::runtime;
 use anyhow::{bail, Context, Result};
@@ -96,7 +97,7 @@ impl Shared {
             return Err(());
         }
         let generation = attachment.next_generation;
-        attachment.next_generation += 1;
+        attachment.next_generation = generation.checked_add(1).ok_or(())?;
         let (cancel_tx, cancel_rx) = watch::channel(false);
         if let Some(previous) = attachment.current.replace(AttachmentSlot {
             generation,
@@ -402,6 +403,22 @@ async fn drain_output<R: AsyncRead + Unpin>(mut reader: R, stream: Stream, share
                 return;
             }
             Ok(count) => {
+                let end = {
+                    let mut meta = shared.meta.lock().expect("metadata state poisoned");
+                    let offset = match stream {
+                        Stream::Stdout => meta.stdout_end,
+                        Stream::Stderr => meta.stderr_end,
+                    };
+                    match checked_end(offset, count) {
+                        Ok(end) => end,
+                        Err(error) => {
+                            meta.failure = Some(error.to_string());
+                            drop(meta);
+                            shared.changed.notify_waiters();
+                            return;
+                        }
+                    }
+                };
                 let data = buffer[..count].to_vec();
                 if !shared.nobuffer
                     && (file.write_all(&data).await.is_err() || file.flush().await.is_err())
@@ -412,12 +429,12 @@ async fn drain_output<R: AsyncRead + Unpin>(mut reader: R, stream: Stream, share
                 let offset = match stream {
                     Stream::Stdout => {
                         let offset = meta.stdout_end;
-                        meta.stdout_end += count as u64;
+                        meta.stdout_end = end;
                         offset
                     }
                     Stream::Stderr => {
                         let offset = meta.stderr_end;
-                        meta.stderr_end += count as u64;
+                        meta.stderr_end = end;
                         offset
                     }
                 };
@@ -482,7 +499,31 @@ async fn handle_connection(mut stream: UnixStream, shared: Arc<Shared>) -> Resul
             stdin_start,
             stdin_eof,
             force,
-        } => attach(stream, shared, offsets, stdin_start, stdin_eof, force).await,
+        } => {
+            attach(
+                stream,
+                shared,
+                offsets,
+                stdin_start,
+                stdin_eof,
+                force,
+                false,
+            )
+            .await
+        }
+        BrokerRequest::AttachFramedV1 {
+            offsets,
+            stdin_start,
+            stdin_eof,
+            force,
+        } => {
+            // Reject BEFORE forced replacement or opening stdin/EOF mutation.
+            if shared.nobuffer {
+                return write_error_line(&mut stream, "framed-v1 requires a buffered session")
+                    .await;
+            }
+            attach(stream, shared, offsets, stdin_start, stdin_eof, force, true).await
+        }
         BrokerRequest::StdinEof { offset } => match declare_stdin_eof(&shared, offset).await {
             Ok(()) => {
                 let response = {
@@ -519,6 +560,7 @@ impl Drop for ConnectionGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn attach(
     mut stream: UnixStream,
     shared: Arc<Shared>,
@@ -526,6 +568,7 @@ async fn attach(
     stdin_start: u64,
     stdin_eof: Option<u64>,
     force: bool,
+    framed: bool,
 ) -> Result<()> {
     let lease = match shared.install_attachment(force) {
         Ok(lease) => lease,
@@ -584,6 +627,8 @@ async fn attach(
             offsets.stderr
         };
         ServerHello {
+            attachment: framed.then(|| FRAMED_ATTACHMENT_V1.to_owned()),
+            stdin_eof_at: if framed { meta.stdin_eof_at } else { None },
             session: session_fact(&shared),
             offsets: AllOffsets {
                 stdin: meta.stdin_position,
@@ -609,16 +654,15 @@ async fn attach(
     let stderr = hello.offsets.stderr;
 
     let (reader, writer) = stream.into_split();
-    let (ack_tx, ack_rx) = mpsc::unbounded_channel();
-    let input_shared = shared.clone();
-    let mut input =
-        tokio::spawn(async move { receive_input(reader, input_shared, generation, ack_tx).await });
-    let output_shared = shared.clone();
-    let mut output = tokio::spawn(async move {
-        if output_shared.nobuffer {
+    let (ack_tx, ack_rx) = watch::channel(hello.offsets.stdin);
+    // Scoped futures: every exit/error/takeover drops both halves and any
+    // pending stdin write before releasing the attachment lease.
+    let input = receive_input(reader, shared.clone(), generation, ack_tx);
+    let output = async {
+        if shared.nobuffer {
             send_live_output(
                 writer,
-                output_shared,
+                shared.clone(),
                 generation,
                 stdout_live,
                 stderr_live,
@@ -628,24 +672,13 @@ async fn attach(
             )
             .await
         } else {
-            send_buffered_output(writer, output_shared, generation, stdout, stderr, ack_rx).await
+            send_buffered_output(writer, shared.clone(), generation, stdout, stderr, ack_rx).await
         }
-    });
-
+    };
     tokio::select! {
-        biased;
-        _ = wait_for_true(lease.cancel.clone()) => {
-            input.abort();
-            output.abort();
-        }
-        result = &mut output => {
-            input.abort();
-            result??;
-        }
-        result = &mut input => {
-            output.abort();
-            result??;
-        }
+        _ = wait_for_true(lease.cancel.clone()) => {},
+        result = output => result?,
+        result = input => result?,
     }
     Ok(())
 }
@@ -665,9 +698,9 @@ async fn receive_input<R: AsyncRead + Unpin>(
     mut reader: R,
     shared: Arc<Shared>,
     generation: u64,
-    acknowledgements: mpsc::UnboundedSender<u64>,
+    acknowledgements: watch::Sender<u64>,
 ) -> Result<()> {
-    while let Some(frame) = read_frame(&mut reader).await? {
+    while let Some(frame) = read_frame(&mut reader, Direction::Input).await? {
         match frame {
             Frame::StdinData { offset, data } => {
                 accept_stdin(&shared, generation, offset, &data, &acknowledgements).await?;
@@ -786,6 +819,7 @@ fn stdin_frame_start_locked(
     data_len: usize,
     nobuffer: bool,
 ) -> Result<(usize, u64)> {
+    checked_end(offset, data_len)?;
     if meta.stdin_eof {
         bail!("stdin data arrived after EOF");
     }
@@ -814,12 +848,25 @@ enum StdinWriteOutcome {
     Wrote { position: u64, reached_eof: bool },
 }
 
+fn publish_receipt(shared: &Shared, generation: u64, latest: &watch::Sender<u64>, position: u64) {
+    let attachment = shared.attachment.lock().expect("attachment state poisoned");
+    if attachment_is_current_locked(&attachment, generation) {
+        latest.send_if_modified(|previous| {
+            if position < *previous {
+                return false;
+            }
+            *previous = position;
+            true
+        });
+    }
+}
+
 async fn accept_stdin(
     shared: &Shared,
     generation: u64,
     offset: u64,
     data: &[u8],
-    acknowledgements: &mpsc::UnboundedSender<u64>,
+    acknowledgements: &watch::Sender<u64>,
 ) -> Result<()> {
     let mut stdin_guard = shared.child_stdin.lock().await;
     if data.is_empty() {
@@ -844,7 +891,7 @@ async fn accept_stdin(
         if should_close {
             shared.changed.notify_waiters();
         }
-        let _ = acknowledgements.send(position);
+        publish_receipt(shared, generation, acknowledgements, position);
         return Ok(());
     }
 
@@ -896,14 +943,14 @@ async fn accept_stdin(
         match outcome {
             StdinWriteOutcome::Superseded | StdinWriteOutcome::NoStdin => return Ok(()),
             StdinWriteOutcome::Duplicate { position } => {
-                let _ = acknowledgements.send(position);
+                publish_receipt(shared, generation, acknowledgements, position);
                 return Ok(());
             }
             StdinWriteOutcome::Wrote {
                 position,
                 reached_eof,
             } => {
-                let _ = acknowledgements.send(position);
+                publish_receipt(shared, generation, acknowledgements, position);
                 if reached_eof {
                     shared.changed.notify_waiters();
                     return Ok(());
@@ -917,7 +964,7 @@ async fn accept_stdin_eof(
     shared: &Shared,
     generation: u64,
     offset: u64,
-    acknowledgements: &mpsc::UnboundedSender<u64>,
+    acknowledgements: &watch::Sender<u64>,
 ) -> Result<()> {
     let mut stdin = shared.child_stdin.lock().await;
     let (position, should_close) = {
@@ -935,7 +982,7 @@ async fn accept_stdin_eof(
     if should_close {
         shared.changed.notify_waiters();
     }
-    let _ = acknowledgements.send(position);
+    publish_receipt(shared, generation, acknowledgements, position);
     Ok(())
 }
 
@@ -948,7 +995,7 @@ async fn send_buffered_output<W: tokio::io::AsyncWrite + Unpin>(
     generation: u64,
     mut stdout_position: u64,
     mut stderr_position: u64,
-    mut acknowledgements: mpsc::UnboundedReceiver<u64>,
+    mut acknowledgements: watch::Receiver<u64>,
 ) -> Result<()> {
     let stdout_file = fs::File::open(&shared.stdout_path)?;
     let stderr_file = fs::File::open(&shared.stderr_path)?;
@@ -957,13 +1004,18 @@ async fn send_buffered_output<W: tokio::io::AsyncWrite + Unpin>(
         if !shared.is_current_attachment(generation) {
             return Ok(());
         }
-        while let Ok(position) = acknowledgements.try_recv() {
+        // One coalesced receipt per output/terminal service turn. No drain
+        // loop can be kept alive by a high-frequency input producer.
+        if acknowledgements.has_changed().unwrap_or(false) {
+            let position = *acknowledgements.borrow_and_update();
             if !shared.is_current_attachment(generation) {
                 return Ok(());
             }
             write_frame(&mut writer, &Frame::StdinPosition { offset: position }).await?;
         }
         let notified = shared.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         let (stdout_end, stderr_end, terminal) = {
             let meta = shared.meta.lock().expect("metadata state poisoned");
             (
@@ -1020,19 +1072,17 @@ async fn send_buffered_output<W: tokio::io::AsyncWrite + Unpin>(
         }
 
         tokio::select! {
-            Some(position) = acknowledgements.recv() => {
-                if !shared.is_current_attachment(generation) {
-                    return Ok(());
-                }
-                write_frame(&mut writer, &Frame::StdinPosition { offset: position }).await?;
-            }
+            _ = acknowledgements.changed() => { acknowledgements.mark_changed(); }
             _ = notified => {}
         }
     }
 }
 
 fn read_at(file: &fs::File, offset: u64, end: u64) -> Result<Vec<u8>> {
-    let count = ((end - offset) as usize).min(CHUNK_SIZE);
+    let count = end
+        .checked_sub(offset)
+        .context("output range is reversed")?
+        .min(CHUNK_SIZE as u64) as usize;
     let mut data = vec![0_u8; count];
     let read = file.read_at(&mut data, offset)?;
     if read == 0 {
@@ -1051,14 +1101,17 @@ async fn send_live_output<W: tokio::io::AsyncWrite + Unpin>(
     mut stderr_live: broadcast::Receiver<OutputChunk>,
     mut stdout_position: u64,
     mut stderr_position: u64,
-    mut acknowledgements: mpsc::UnboundedReceiver<u64>,
+    mut acknowledgements: watch::Receiver<u64>,
 ) -> Result<()> {
     let mut prefer_stdout = true;
     loop {
         if !shared.is_current_attachment(generation) {
             return Ok(());
         }
-        while let Ok(position) = acknowledgements.try_recv() {
+        // One coalesced receipt per output/terminal service turn. No drain
+        // loop can be kept alive by a high-frequency input producer.
+        if acknowledgements.has_changed().unwrap_or(false) {
+            let position = *acknowledgements.borrow_and_update();
             if !shared.is_current_attachment(generation) {
                 return Ok(());
             }
@@ -1120,6 +1173,8 @@ async fn send_live_output<W: tokio::io::AsyncWrite + Unpin>(
         }
 
         let changed = shared.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
         let (terminal, stdout_end, stderr_end) = {
             let meta = shared.meta.lock().expect("metadata state poisoned");
             (
@@ -1143,12 +1198,7 @@ async fn send_live_output<W: tokio::io::AsyncWrite + Unpin>(
         }
 
         tokio::select! {
-            Some(position) = acknowledgements.recv() => {
-                if !shared.is_current_attachment(generation) {
-                    return Ok(());
-                }
-                write_frame(&mut writer, &Frame::StdinPosition { offset: position }).await?;
-            }
+            _ = acknowledgements.changed() => { acknowledgements.mark_changed(); }
             result = stdout_live.recv() => if let Ok(chunk) = result {
                 send_live_chunk(
                     &mut writer,
@@ -1434,6 +1484,116 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn latest_receipt_is_constant_size_sticky_monotonic_and_generation_fenced() {
+        let broker = TestBroker::new(false);
+        let old = broker.shared.install_attachment(false).unwrap().generation;
+        let (tx, mut rx) = watch::channel(0);
+        for position in 1..=100_000 {
+            publish_receipt(&broker.shared, old, &tx, position);
+        }
+        rx.changed().await.unwrap(); // updates made before the wait are sticky
+        assert_eq!(*rx.borrow_and_update(), 100_000);
+        assert!(!rx.has_changed().unwrap()); // no queued historical positions
+        publish_receipt(&broker.shared, old, &tx, 1);
+        assert!(!rx.has_changed().unwrap());
+        broker.shared.install_attachment(true).unwrap();
+        publish_receipt(&broker.shared, old, &tx, 100_001);
+        assert!(!rx.has_changed().unwrap());
+        broker.kill().await;
+    }
+
+    #[test]
+    fn stdin_ranges_reject_overflow_even_for_replay_and_check_eof() {
+        let meta = Meta {
+            stdin_position: u64::MAX - 2,
+            ..Meta::default()
+        };
+        assert!(stdin_frame_start_locked(&meta, u64::MAX - 4, 4, false).is_ok());
+        assert!(stdin_frame_start_locked(&meta, u64::MAX - 4, 5, false).is_err());
+        let meta = Meta {
+            stdin_position: 5,
+            stdin_eof_at: Some(6),
+            ..Meta::default()
+        };
+        assert!(stdin_frame_start_locked(&meta, 3, 3, false).is_ok());
+        assert!(stdin_frame_start_locked(&meta, 3, 4, false).is_err());
+        assert!(stdin_frame_start_locked(&meta, 6, 0, false).is_err());
+    }
+
+    struct UpdatingWriter {
+        bytes: Vec<u8>,
+        latest: watch::Sender<u64>,
+    }
+    impl AsyncWrite for UpdatingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            assert!(self.bytes.len() < 8 * CHUNK_SIZE, "receipt starvation");
+            self.bytes.extend_from_slice(bytes);
+            self.latest.send_modify(|value| *value += 1);
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn continuous_receipts_cannot_starve_either_output_or_actual_terminal() {
+        let broker = TestBroker::new(false);
+        let generation = broker.shared.install_attachment(false).unwrap().generation;
+        fs::write(&broker.shared.stdout_path, vec![1; 2 * CHUNK_SIZE]).unwrap();
+        fs::write(&broker.shared.stderr_path, vec![2; 2 * CHUNK_SIZE]).unwrap();
+        {
+            let mut meta = broker.shared.meta.lock().unwrap();
+            meta.stdout_end = (2 * CHUNK_SIZE) as u64;
+            meta.stderr_end = (2 * CHUNK_SIZE) as u64;
+            meta.stdout_closed = true;
+            meta.stderr_closed = true;
+            meta.status = Some(ExitResult {
+                code: Some(23),
+                signal: None,
+            });
+        }
+        let (tx, mut rx) = watch::channel(0);
+        rx.mark_changed();
+        let mut writer = UpdatingWriter {
+            bytes: Vec::new(),
+            latest: tx,
+        };
+        send_buffered_output(&mut writer, broker.shared.clone(), generation, 0, 0, rx)
+            .await
+            .unwrap();
+        let mut bytes = writer.bytes.as_slice();
+        let mut kinds = Vec::new();
+        while let Some(frame) = read_frame(&mut bytes, Direction::Output).await.unwrap() {
+            kinds.push(match frame {
+                Frame::StdinPosition { .. } => 5,
+                Frame::StdoutData { .. } => 3,
+                Frame::StderrData { .. } => 4,
+                Frame::Exit(result) => {
+                    assert_eq!(result.code, Some(23));
+                    6
+                }
+                _ => unreachable!(),
+            });
+        }
+        assert_eq!(kinds, [5, 3, 5, 4, 5, 3, 5, 4, 5, 6]);
+        broker.kill().await;
+    }
+
     #[test]
     fn active_cancel_resets_old_ttl_and_admitted_connection_pins_expiry() {
         let now = tokio::time::Instant::now();
@@ -1478,7 +1638,7 @@ mod tests {
         let broker = TestBroker::new(false);
         let old = broker.shared.install_attachment(false).unwrap().generation;
         let new = broker.shared.install_attachment(true).unwrap().generation;
-        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel();
+        let (ack_tx, ack_rx) = watch::channel(0);
 
         accept_stdin(&broker.shared, old, 0, b"x", &ack_tx)
             .await
@@ -1490,7 +1650,7 @@ mod tests {
             assert_eq!(meta.stdin_eof_at, None);
             assert!(!meta.stdin_eof);
         }
-        assert!(ack_rx.try_recv().is_err());
+        assert!(!ack_rx.has_changed().unwrap());
         assert!(broker.shared.child_stdin.lock().await.is_some());
         assert!(broker.shared.is_current_attachment(new));
         broker.kill().await;
@@ -1504,7 +1664,7 @@ mod tests {
             let mut meta = broker.shared.meta.lock().expect("metadata state poisoned");
             meta.stdin_eof_at = Some(5);
         }
-        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel();
+        let (ack_tx, ack_rx) = watch::channel(0);
 
         accept_stdin(&broker.shared, generation, 5, b"", &ack_tx)
             .await
@@ -1516,7 +1676,8 @@ mod tests {
             assert_eq!(meta.stdin_eof_at, Some(5));
             assert!(meta.stdin_eof);
         }
-        assert_eq!(ack_rx.try_recv().unwrap(), 5);
+        assert!(ack_rx.has_changed().unwrap());
+        assert_eq!(*ack_rx.borrow(), 5);
         assert!(broker.shared.child_stdin.lock().await.is_none());
         broker.kill().await;
     }
@@ -1526,7 +1687,7 @@ mod tests {
         let broker = TestBroker::new(false);
         let old = broker.shared.install_attachment(false).unwrap().generation;
         let new = broker.shared.install_attachment(true).unwrap().generation;
-        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel();
+        let (ack_tx, ack_rx) = watch::channel(0);
 
         accept_stdin_eof(&broker.shared, old, 0, &ack_tx)
             .await
@@ -1537,7 +1698,7 @@ mod tests {
             assert_eq!(meta.stdin_eof_at, None);
             assert!(!meta.stdin_eof);
         }
-        assert!(ack_rx.try_recv().is_err());
+        assert!(!ack_rx.has_changed().unwrap());
         assert!(broker.shared.child_stdin.lock().await.is_some());
         assert!(broker.shared.is_current_attachment(new));
         broker.kill().await;

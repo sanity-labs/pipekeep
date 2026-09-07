@@ -31,7 +31,8 @@ async fn run() -> Result<i32> {
             nobuffer,
             force,
             group_pidfd,
-        } => server::run(id, command, nobuffer, force, group_pidfd).await,
+            framed,
+        } => server::run(id, command, nobuffer, force, group_pidfd, framed).await,
         Mode::Cancel {
             id,
             require_group_pidfd,
@@ -72,6 +73,7 @@ fn capabilities() -> serde_json::Value {
         "protocol": protocol::ATTACHMENT_PROTOCOL_VERSION,
         "capabilities": [
             "raw-public-streams",
+            protocol::FRAMED_ATTACHMENT_V1,
             "absolute-resume-offsets",
             "sticky-stdin-eof",
             "separate-stdout-stderr",
