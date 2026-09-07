@@ -1,5 +1,7 @@
 mod broker;
+mod cancellation;
 mod cli;
+mod group_pidfd;
 mod outer;
 mod protocol;
 mod runtime;
@@ -28,15 +30,21 @@ async fn run() -> Result<i32> {
             command,
             nobuffer,
             force,
-        } => server::run(id, command, nobuffer, force).await,
-        Mode::Cancel { id } => server::cancel(&id).await,
+            group_pidfd,
+        } => server::run(id, command, nobuffer, force, group_pidfd).await,
+        Mode::Cancel {
+            id,
+            require_group_pidfd,
+        } => server::cancel(&id, require_group_pidfd).await,
+        Mode::Session { id } => server::session(&id).await,
         Mode::Pid { id } => server::pid(&id).await,
         Mode::Broker {
             id,
+            group_pidfd,
             session_dir,
             command,
             nobuffer,
-        } => broker::run(id, session_dir, command, nobuffer).await,
+        } => broker::run(id, session_dir, command, nobuffer, group_pidfd).await,
         Mode::Help => {
             print!("{}", cli::HELP);
             Ok(0)
@@ -69,6 +77,7 @@ fn capabilities() -> serde_json::Value {
             "separate-stdout-stderr",
             "process-group-cancel",
             "cancel-outcome",
+            "opt-in-group-pidfd-cancel-v1",
             "terminal-replay",
             "nobuffer",
             "forced-attach-takeover",
