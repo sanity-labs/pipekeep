@@ -110,9 +110,10 @@ entire process group is settled and the broker has recorded the terminal
 result.
 
 `cancel` returns that terminal result together with a machine-readable
-`outcome`: `cancel_won` when the TERM or KILL attempt reached at least one
-still-live member of the recorded process group, `already_exited` when the
-group had settled before cancellation could signal any remaining member. The
+`outcome`: `cancel_won` when at least one TERM or KILL syscall succeeded
+(including zombie-only groups), and `already_exited` for later settled calls
+or when no signal syscall succeeded before settlement. A successful syscall
+is not proof of a live recipient or historical request attribution. The
 outcome is decided from the actual signal attempts, so a group that
 disappears between inspection and signaling resolves honestly to
 `already_exited` rather than a fabricated win. If the command exits naturally
@@ -380,3 +381,63 @@ There is no total ordering between stdout and stderr, matching ordinary
 separate pipes. Delivery to a local file descriptor does not mean a downstream
 application has processed the byte. The protocol improves reconnection; it
 does not make the command or its side effects transactional.
+
+### Opt-in original-group lifetime authority
+
+`--group-pidfd` selects the bounded Linux backend only for new sessions. The
+broker's opening/control `session.capabilities` fact must contain
+`group-pidfd-cancel-v1`; an upgraded binary does not retrofit older brokers.
+The distinct `cancel-group-pidfd` control action fails before signaling on an
+old/non-opted broker. See README for the public roundtrip and failure contract.
+
+The opted-in spawn path uses std Child to acquire the original-leader pidfd
+before fallible Tokio I/O setup or any reaper/drop adapter; one exact-child
+blocking wait subsequently retains the real exit. Acquisition failure after
+dispatch retains an explicitly failed session, with no numeric fallback. Default
+Unix sessions keep the ordinary Tokio spawn and numeric-group cancellation.
+Only ordinary sessions map a failed wait to the shipped synthetic exit 1, so
+attachments finish and legacy TTL can run after both output closures. This is
+compatibility, not verified actual command status. Opted-in wait errors retain
+failure with no exit and cannot supply successful settlement.
+
+The public opted-in create path reads the inherited SIGCHLD policy before
+session-directory allocation/broker spawn. It does not run the broker's full
+group probe because a proxy need not lead its group. The broker independently
+performs the full preflight and actual workload-pidfd verification before any
+reaper. Neither path mutates SIGCHLD; non-opted creation adds no prerequisite.
+After dispatch, a proxy try_wait error is not observed broker exit or proof that
+the workload did not start. It returns an explicit ambiguous-startup diagnostic
+and retains the session/authority, as does an opted-in readiness timeout. There
+is no cleanup/relaunch decision based on errno, log text or pidfiles.
+
+A synchronous cancellation mutex owns the handle, operation phase and result.
+One detached task advances TERM/grace/KILL/group absence/output settlement; socket
+handlers only admit/join it. Every group syscall borrows the owned fd under that
+mutex. Successful leader reap plus group ESRCH transitions to permanent no-signal
+before handle release. Output can still be pending. Wait/syscall/output errors
+and the bounded settlement deadline yield retained errors, never synthetic exits.
+Later successful calls return already_exited rather than replaying cancel_won.
+
+The accept loop serializes TTL expiry with connection admission. Admission resets
+the opted-in idle clock immediately, including an operation completing between
+ticks. Accepted connections and active cancellation pin the broker; completion or
+failure gets a fresh idle TTL. Failed operations do not retry and can expire with
+work still alive. Neither this lifetime nor retained memory survives broker loss.
+This mechanism covers original-group membership, not escaped descendants.
+
+Output/storage failure handling remains deferred to the finite-spool/retained-
+overflow work. Precisely, an opted-in read error records metadata failure,
+notifies waiters, and returns without closing that stream. With no admitted
+cancellation, terminal stays false and idle expiry cannot start. An admitted
+cancellation fails on that metadata failure; its finished state makes idle
+expiry eligible only after active connections release it. Ordinary read errors
+still count as stream closure and can therefore truncate output silently.
+
+In both modes, failure to open the drain's buffer file (even in nobuffer mode),
+or a buffered write/flush failure, returns without a failure record, closure or
+waiter notification. Failed writes/flushes may leave bytes in the file that were
+not added to published output offsets. The missing closure prevents terminal
+completion; opted-in cancellation can reach its settlement deadline, with
+connections still able to pin retention afterwards. No drain, spool, offset or
+receipt behavior is changed by this repair, and it makes no storage-failure
+lifetime bound or hostile-tree containment claim.

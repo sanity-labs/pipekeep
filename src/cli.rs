@@ -12,8 +12,13 @@ pub enum Mode {
         command: Vec<String>,
         nobuffer: bool,
         force: bool,
+        group_pidfd: bool,
     },
     Cancel {
+        id: String,
+        require_group_pidfd: bool,
+    },
+    Session {
         id: String,
     },
     Pid {
@@ -21,6 +26,7 @@ pub enum Mode {
     },
     Broker {
         id: String,
+        group_pidfd: bool,
         session_dir: PathBuf,
         command: Vec<String>,
         nobuffer: bool,
@@ -39,6 +45,7 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
         "--help" | "-h" => return Ok(Mode::Help),
         "--version" | "-V" => return Ok(Mode::Version),
         "cancel" => return parse_control(&args[1..], true),
+        "session" => return parse_session(&args[1..]),
         "pid" => return parse_control(&args[1..], false),
         "capabilities" => return parse_capabilities(&args[1..]),
         "__broker" => return parse_broker(&args[1..]),
@@ -48,6 +55,7 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
     let mut id = None;
     let mut nobuffer = false;
     let mut force = false;
+    let mut group_pidfd = false;
     let index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -61,6 +69,10 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
             }
             "--nobuffer" => {
                 nobuffer = true;
+                args.remove(index);
+            }
+            "--group-pidfd" => {
+                group_pidfd = true;
                 args.remove(index);
             }
             "--force" => {
@@ -85,8 +97,12 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
             command: args,
             nobuffer,
             force,
+            group_pidfd,
         })
     } else {
+        if group_pidfd {
+            bail!("--group-pidfd requires --id and new-session creation");
+        }
         if force {
             bail!("--force requires --id and only applies to attach-only sessions");
         }
@@ -97,13 +113,28 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
     }
 }
 
-fn parse_control(args: &[String], cancel: bool) -> Result<Mode> {
+fn parse_session(args: &[String]) -> Result<Mode> {
     if args.len() != 2 || args[0] != "--id" {
         bail!("expected --id ID");
+    }
+    Ok(Mode::Session {
+        id: args[1].clone(),
+    })
+}
+
+fn parse_control(args: &[String], cancel: bool) -> Result<Mode> {
+    let mut args = args.to_vec();
+    let require_group_pidfd = cancel && args.iter().any(|s| s == "--require-group-pidfd");
+    if require_group_pidfd {
+        args.retain(|s| s != "--require-group-pidfd");
+    }
+    if args.len() != 2 || args[0] != "--id" {
+        bail!("expected --id ID [--require-group-pidfd for cancel]");
     }
     if cancel {
         Ok(Mode::Cancel {
             id: args[1].clone(),
+            require_group_pidfd,
         })
     } else {
         Ok(Mode::Pid {
@@ -115,6 +146,7 @@ fn parse_control(args: &[String], cancel: bool) -> Result<Mode> {
 fn parse_broker(args: &[String]) -> Result<Mode> {
     let mut id = None;
     let mut session_dir = None;
+    let mut group_pidfd = false;
     let mut nobuffer = false;
     let mut index = 0;
     while index < args.len() {
@@ -122,6 +154,10 @@ fn parse_broker(args: &[String]) -> Result<Mode> {
             "--id" => {
                 id = args.get(index + 1).cloned();
                 index += 2;
+            }
+            "--group-pidfd" => {
+                group_pidfd = true;
+                index += 1;
             }
             "--session-dir" => {
                 session_dir = args.get(index + 1).map(PathBuf::from);
@@ -143,6 +179,7 @@ fn parse_broker(args: &[String]) -> Result<Mode> {
         bail!("broker command is missing");
     }
     Ok(Mode::Broker {
+        group_pidfd,
         id: id.ok_or_else(|| anyhow::anyhow!("broker ID is missing"))?,
         session_dir: session_dir
             .ok_or_else(|| anyhow::anyhow!("broker session directory is missing"))?,
@@ -163,8 +200,9 @@ pub const HELP: &str = r#"pipekeep: resumable process pipes
 
 Usage:
   pipekeep [--nobuffer] [--] TRANSPORT [ARG...]
-  pipekeep --id ID [--nobuffer] [--force] -- COMMAND [ARG...]
-  pipekeep cancel --id ID
+  pipekeep --id ID [--nobuffer] [--force] [--group-pidfd] -- COMMAND [ARG...]
+  pipekeep cancel --id ID [--require-group-pidfd]
+  pipekeep session --id ID
   pipekeep pid --id ID
   pipekeep capabilities --json
   pipekeep --version

@@ -1,3 +1,5 @@
+use crate::cancellation::Cancellation;
+use crate::group_pidfd::{GroupPidfd, GroupSignal};
 use crate::protocol::{
     read_frame, read_line, write_error_line, write_frame, write_json_line, AllOffsets,
     BrokerRequest, CancelOutcome, ExitResult, Frame, OutputOffsets, ServerHello,
@@ -62,6 +64,7 @@ struct Meta {
     stdout_closed: bool,
     stderr_closed: bool,
     status: Option<ExitResult>,
+    failure: Option<String>,
 }
 
 struct Shared {
@@ -74,6 +77,7 @@ struct Shared {
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     command_pid: i32,
+    cancellation: Option<StdMutex<Cancellation>>,
     nobuffer: bool,
     attachment: StdMutex<AttachmentState>,
     active_attachments: AtomicUsize,
@@ -136,7 +140,13 @@ pub async fn run(
     session_dir: PathBuf,
     command: Vec<String>,
     nobuffer: bool,
+    group_pidfd: bool,
 ) -> Result<i32> {
+    // Pre-dispatch rejection leaves the startup log for the creating proxy
+    // to read and remove. Once dispatch is possible the broker owns cleanup.
+    if group_pidfd {
+        GroupPidfd::preflight().context("group pidfd unsupported; workload not started")?;
+    }
     let _guard = SessionGuard(session_dir.clone());
     fs::set_permissions(&session_dir, fs::Permissions::from_mode(0o700))?;
 
@@ -145,6 +155,15 @@ pub async fn run(
     fs::File::create(&stdout_path)?;
     fs::File::create(&stderr_path)?;
 
+    // All fallible session/socket setup precedes workload dispatch.
+    let socket_path = runtime::socket_path(&session_dir);
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("cannot bind broker socket {}", socket_path.display()))?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+    fs::write(
+        session_dir.join("broker.pid"),
+        std::process::id().to_string(),
+    )?;
     let mut child_command = Command::new(&command[0]);
     child_command
         .args(&command[1..])
@@ -159,30 +178,71 @@ pub async fn run(
             Ok(())
         });
     }
-    let mut child = child_command
-        .spawn()
-        .with_context(|| format!("cannot start command {:?}", command[0]))?;
-    let command_pid = child.id().context("command has no PID")? as i32;
-    fs::write(session_dir.join("command.pid"), command_pid.to_string())?;
-    let child_stdin = child.stdin.take().context("cannot open command stdin")?;
-    let child_stdout = child.stdout.take().context("cannot open command stdout")?;
-    let child_stderr = child.stderr.take().context("cannot open command stderr")?;
-
-    let socket_path = runtime::socket_path(&session_dir);
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("cannot bind broker socket {}", socket_path.display()))?;
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
-    fs::write(
-        session_dir.join("broker.pid"),
-        std::process::id().to_string(),
-    )?;
+    let (command_pid, child_stdin, child_stdout, child_stderr, cancellation, wait, setup_failure) =
+        if group_pidfd {
+            // std spawn does no Tokio I/O/reaper setup. Acquire while the child is
+            // still owned and unreaped, including instant exits. No fallible `?`
+            // or Child drop between dispatch and this acquisition/retention path.
+            let mut child = child_command
+                .as_std_mut()
+                .spawn()
+                .with_context(|| format!("cannot start command {:?}", command[0]))?;
+            let pid = child.id();
+            let handle = GroupPidfd::acquire(pid)
+            .map(|handle| Box::new(handle) as Box<dyn GroupSignal>)
+            .map_err(|error| format!("workload started; group pidfd acquisition/verification failed: {error}; session retained; cancellation unavailable; do not retry creation"));
+            let cancellation = Some(StdMutex::new(Cancellation::verify_acquired(handle)));
+            let stdin =
+                tokio::process::ChildStdin::from_std(child.stdin.take().expect("piped stdin"));
+            let stdout =
+                tokio::process::ChildStdout::from_std(child.stdout.take().expect("piped stdout"));
+            let stderr =
+                tokio::process::ChildStderr::from_std(child.stderr.take().expect("piped stderr"));
+            let failure = stdin
+                .as_ref()
+                .err()
+                .or(stdout.as_ref().err())
+                .or(stderr.as_ref().err())
+                .map(|e| {
+                    format!("workload started; pipe setup failed: {e}; terminal output unverified")
+                });
+            // One exact-child wait, only after acquisition; no wait-any/subreaper.
+            // A blocking waiter does not consume a Tokio async worker.
+            let wait = tokio::task::spawn_blocking(move || child.wait());
+            (
+                pid as i32,
+                stdin.ok(),
+                stdout.ok(),
+                stderr.ok(),
+                cancellation,
+                wait,
+                failure,
+            )
+        } else {
+            let mut child = child_command
+                .spawn()
+                .with_context(|| format!("cannot start command {:?}", command[0]))?;
+            let pid = child.id().context("command has no PID")? as i32;
+            let stdin = child.stdin.take();
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let wait = tokio::spawn(async move { child.wait().await });
+            (pid, stdin, stdout, stderr, None, wait, None)
+        };
+    // A metadata write failure after dispatch must not destroy the broker.
+    if let Err(error) = fs::write(session_dir.join("command.pid"), command_pid.to_string()) {
+        eprintln!("workload started; cannot write informational command.pid: {error}");
+    }
 
     let (terminal_tx, terminal_rx) = watch::channel(false);
     let (stdout_live, _) = broadcast::channel(64);
     let (stderr_live, _) = broadcast::channel(64);
     let shared = Arc::new(Shared {
-        meta: StdMutex::new(Meta::default()),
-        child_stdin: Mutex::new(Some(child_stdin)),
+        meta: StdMutex::new(Meta {
+            failure: setup_failure,
+            ..Meta::default()
+        }),
+        child_stdin: Mutex::new(child_stdin),
         changed: Notify::new(),
         terminal: terminal_tx,
         stdout_live,
@@ -190,6 +250,7 @@ pub async fn run(
         stdout_path,
         stderr_path,
         command_pid,
+        cancellation,
         nobuffer,
         attachment: StdMutex::new(AttachmentState {
             next_generation: 1,
@@ -198,49 +259,87 @@ pub async fn run(
         active_attachments: AtomicUsize::new(0),
     });
 
-    tokio::spawn(drain_output(child_stdout, Stream::Stdout, shared.clone()));
-    tokio::spawn(drain_output(child_stderr, Stream::Stderr, shared.clone()));
+    if let Some(stdout) = child_stdout {
+        tokio::spawn(drain_output(stdout, Stream::Stdout, shared.clone()));
+    }
+    if let Some(stderr) = child_stderr {
+        tokio::spawn(drain_output(stderr, Stream::Stderr, shared.clone()));
+    }
     let wait_shared = shared.clone();
     tokio::spawn(async move {
-        let result = child.wait().await;
-        let mut stdin = wait_shared.child_stdin.lock().await;
-        stdin.take();
-        drop(stdin);
-        let mut meta = wait_shared.meta.lock().expect("metadata state poisoned");
-        meta.status = Some(match result {
-            Ok(status) => ExitResult::from_status(status),
-            Err(_) => ExitResult {
-                code: Some(1),
-                signal: None,
-            },
-        });
-        wait_shared.announce_if_terminal(&meta);
-        drop(meta);
+        let result = wait.await;
+        {
+            let mut meta = wait_shared.meta.lock().expect("metadata state poisoned");
+            match result {
+                Ok(Ok(status)) => meta.status = Some(ExitResult::from_status(status)),
+                _ if wait_shared.cancellation.is_none() => {
+                    // Shipped ordinary-session compatibility: a failed wait
+                    // reports exit 1 so attachments finish and legacy TTL runs.
+                    // This fallback is NOT verified command status and must
+                    // never enter the opted-in settlement path.
+                    meta.status = Some(ExitResult {
+                        code: Some(1),
+                        signal: None,
+                    });
+                }
+                error => {
+                    meta.failure = Some(format!(
+                    "command wait failed; actual exit and group settlement unverified: {error:?}"
+                ))
+                }
+            }
+            wait_shared.announce_if_terminal(&meta);
+        }
         wait_shared.changed.notify_waiters();
+        // Retain the actual wait before potentially contended stdin cleanup.
+        wait_shared.child_stdin.lock().await.take();
     });
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let cleanup_shared = shared.clone();
-    tokio::spawn(async move {
-        wait_for_true(terminal_rx).await;
-        while cleanup_shared.active_attachments.load(Ordering::Acquire) != 0 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let ttl = std::env::var("PIPEKEEP_SESSION_TTL_SECS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(300_u64);
-        tokio::time::sleep(Duration::from_secs(ttl)).await;
-        while cleanup_shared.active_attachments.load(Ordering::Acquire) != 0 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let _ = shutdown_tx.send(()).await;
-    });
+    if !group_pidfd {
+        tokio::spawn(async move {
+            wait_for_true(terminal_rx).await;
+            while cleanup_shared.active_attachments.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let ttl = std::env::var("PIPEKEEP_SESSION_TTL_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(300_u64);
+            tokio::time::sleep(Duration::from_secs(ttl)).await;
+            while cleanup_shared.active_attachments.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let _ = shutdown_tx.send(()).await;
+        });
+    }
 
+    let ttl = Duration::from_secs(env_seconds("PIPEKEEP_SESSION_TTL_SECS", 300));
+    let mut idle_since = None;
+    let mut accept_error_reported = false;
+    let mut expiry_tick = tokio::time::interval(Duration::from_millis(25));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (stream, _) = match accepted {
+                    Ok(connection) => { accept_error_reported = false; connection }
+                    Err(error) if group_pidfd => {
+                        // FD/resource exhaustion after dispatch must not drop
+                        // the exact child/handle owner merely because control
+                        // admission is temporarily unavailable.
+                        if !accept_error_reported {
+                            eprintln!("broker accept failed; session/workload retained: {error}");
+                            accept_error_reported = true;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                // Reset on admission itself, even if a short cancellation
+                // starts and finishes entirely between two expiry ticks.
+                if group_pidfd { idle_since = None; }
                 let connection_shared = shared.clone();
                 connection_shared.active_attachments.fetch_add(1, Ordering::AcqRel);
                 tokio::spawn(async move {
@@ -250,7 +349,17 @@ pub async fn run(
                     }
                 });
             }
-            _ = shutdown_rx.recv() => break,
+            _ = shutdown_rx.recv(), if !group_pidfd => break,
+            _ = expiry_tick.tick(), if group_pidfd => {
+                // Admission and expiry share THIS accept loop. An accepted
+                // connection pins the broker until its cancel is marked active;
+                // the independent operation then pins it across disconnection.
+                let cancel = shared.cancellation.as_ref().expect("opt-in state")
+                    .lock().expect("cancellation poisoned");
+                let busy = shared.active_attachments.load(Ordering::Acquire) != 0 || cancel.active();
+                let eligible = *shared.terminal.borrow() || cancel.finished();
+                if hardened_expired(&mut idle_since, tokio::time::Instant::now(), ttl, busy, eligible) { break; }
+            }
         }
     }
     Ok(0)
@@ -274,6 +383,13 @@ async fn drain_output<R: AsyncRead + Unpin>(mut reader: R, stream: Stream, share
     let mut buffer = vec![0_u8; CHUNK_SIZE];
     loop {
         match reader.read(&mut buffer).await {
+            Err(error) if shared.cancellation.is_some() => {
+                shared.meta.lock().expect("metadata state poisoned").failure = Some(format!(
+                    "output read failed; terminal output unverified: {error}"
+                ));
+                shared.changed.notify_waiters();
+                return;
+            }
             Ok(0) | Err(_) => {
                 let mut meta = shared.meta.lock().expect("metadata state poisoned");
                 match stream {
@@ -332,16 +448,35 @@ async fn handle_connection(mut stream: UnixStream, shared: Arc<Shared>) -> Resul
         BrokerRequest::Pid => {
             write_json_line(&mut stream, &serde_json::json!({"pid": shared.command_pid})).await
         }
-        BrokerRequest::Cancel => match cancel_process_group(shared.clone()).await {
-            Ok((outcome, result)) => {
-                write_json_line(
-                    &mut stream,
-                    &serde_json::json!({"exit": result, "outcome": outcome}),
-                )
-                .await
+        BrokerRequest::Session => {
+            let response = {
+                let meta = shared.meta.lock().expect("metadata state poisoned");
+                serde_json::json!({"pid": shared.command_pid, "session": session_fact(&shared),
+                    "leader_exit": meta.status, "stdout_closed": meta.stdout_closed,
+                    "stderr_closed": meta.stderr_closed, "failure": meta.failure})
+            };
+            write_json_line(&mut stream, &response).await
+        }
+        BrokerRequest::Cancel | BrokerRequest::CancelGroupPidfd => {
+            let required = matches!(request, BrokerRequest::CancelGroupPidfd);
+            let result = if shared.cancellation.is_some() {
+                cancel_hardened(shared.clone()).await
+            } else if required {
+                Err(anyhow::anyhow!(
+                    "session lacks verified group-pidfd-cancel-v1; no signal attempted"
+                ))
+            } else {
+                cancel_process_group(shared.clone()).await
+            };
+            match result {
+                Ok((outcome, result)) => {
+                    let mut response = serde_json::json!({"exit": result, "outcome": outcome});
+                    if let Some(fact) = session_fact(&shared) { response["session"] = serde_json::to_value(fact)?; }
+                    write_json_line(&mut stream, &response).await
+                }
+                Err(error) => write_json_line(&mut stream, &serde_json::json!({"error": error.to_string(), "session": session_fact(&shared)})).await,
             }
-            Err(error) => write_error_line(&mut stream, &error.to_string()).await,
-        },
+        }
         BrokerRequest::Attach {
             offsets,
             stdin_start,
@@ -449,6 +584,7 @@ async fn attach(
             offsets.stderr
         };
         ServerHello {
+            session: session_fact(&shared),
             offsets: AllOffsets {
                 stdin: meta.stdin_position,
                 stdout,
@@ -1070,10 +1206,117 @@ async fn send_live_chunk<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
+fn session_fact(shared: &Shared) -> Option<crate::protocol::SessionFact> {
+    shared
+        .cancellation
+        .as_ref()
+        .map(|c| c.lock().expect("cancellation poisoned").fact())
+}
+
+fn env_seconds(name: &str, default: u64) -> u64 {
+    // Bound Instant arithmetic even for malformed/adversarial configuration.
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+        .min(86400)
+}
+
+fn hardened_expired(
+    idle_since: &mut Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    ttl: Duration,
+    busy: bool,
+    eligible: bool,
+) -> bool {
+    if busy || !eligible {
+        *idle_since = None;
+        return false;
+    }
+    now.duration_since(*idle_since.get_or_insert(now)) >= ttl
+}
+
+async fn cancel_hardened(shared: Arc<Shared>) -> Result<(CancelOutcome, ExitResult)> {
+    let first = shared
+        .cancellation
+        .as_ref()
+        .expect("opt-in state")
+        .lock()
+        .expect("cancellation poisoned")
+        .start(
+            tokio::time::Instant::now(),
+            Duration::from_secs(env_seconds("PIPEKEEP_CANCEL_GRACE_SECS", 3)),
+            Duration::from_secs(env_seconds("PIPEKEEP_CANCEL_SETTLE_SECS", 30).max(1)),
+        );
+    if first {
+        let owner = shared.clone();
+        tokio::spawn(async move {
+            let mut first_step = true;
+            loop {
+                let (exit, terminal, failure) = {
+                    let meta = owner.meta.lock().expect("metadata state poisoned");
+                    (
+                        meta.status.clone(),
+                        meta.stdout_closed && meta.stderr_closed && meta.status.is_some(),
+                        meta.failure.clone(),
+                    )
+                };
+                let finished = {
+                    let mut cancel = owner
+                        .cancellation
+                        .as_ref()
+                        .expect("opt-in state")
+                        .lock()
+                        .expect("cancellation poisoned");
+                    cancel.step(
+                        tokio::time::Instant::now(),
+                        exit,
+                        terminal,
+                        failure,
+                        first_step,
+                    );
+                    cancel.finished()
+                };
+                owner.changed.notify_waiters();
+                if finished {
+                    break;
+                }
+                first_step = false;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+    }
+    loop {
+        let changed = shared.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let result = shared
+            .cancellation
+            .as_ref()
+            .expect("opt-in state")
+            .lock()
+            .expect("cancellation poisoned")
+            .result
+            .clone();
+        if let Some(result) = result {
+            let (outcome, exit) = result.map_err(anyhow::Error::msg)?;
+            return Ok((
+                if first {
+                    outcome
+                } else {
+                    CancelOutcome::AlreadyExited
+                },
+                exit,
+            ));
+        }
+        changed.await;
+    }
+}
+
 async fn cancel_process_group(shared: Arc<Shared>) -> Result<(CancelOutcome, ExitResult)> {
     let pgid = Pid::from_raw(shared.command_pid);
     // Each signal attempt doubles as the liveness inspection: Ok means the
-    // signal reached at least one remaining group member, ESRCH means the
+    // syscall succeeded (including zombie-only groups), ESRCH means the
     // group had already settled before anything could be signaled. Deciding
     // the outcome from the attempts themselves keeps the group-disappeared
     // race honest — a group gone by signal time is never counted as won.
@@ -1172,6 +1415,7 @@ mod tests {
                     stdout_path,
                     stderr_path,
                     command_pid,
+                    cancellation: None,
                     nobuffer,
                     attachment: StdMutex::new(AttachmentState {
                         next_generation: 1,
@@ -1188,6 +1432,24 @@ mod tests {
             let _ = self.child.kill().await;
             let _ = self.child.wait().await;
         }
+    }
+
+    #[test]
+    fn active_cancel_resets_old_ttl_and_admitted_connection_pins_expiry() {
+        let now = tokio::time::Instant::now();
+        let ttl = Duration::from_secs(1);
+        let mut idle = None;
+        assert!(!hardened_expired(&mut idle, now, ttl, false, true));
+        assert!(!hardened_expired(&mut idle, now + ttl, ttl, true, true));
+        assert!(idle.is_none());
+        assert!(!hardened_expired(
+            &mut idle,
+            now + ttl * 2,
+            ttl,
+            false,
+            true
+        ));
+        assert!(hardened_expired(&mut idle, now + ttl * 3, ttl, false, true));
     }
 
     #[tokio::test]

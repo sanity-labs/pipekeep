@@ -21,7 +21,13 @@ struct AttachmentOpen {
     force: bool,
 }
 
-pub async fn run(id: String, command: Vec<String>, nobuffer: bool, force: bool) -> Result<i32> {
+pub async fn run(
+    id: String,
+    command: Vec<String>,
+    nobuffer: bool,
+    force: bool,
+    group_pidfd: bool,
+) -> Result<i32> {
     let mut input = tokio::io::stdin();
     let mut output = tokio::io::stdout();
     let line = read_line(&mut input)
@@ -39,6 +45,14 @@ pub async fn run(id: String, command: Vec<String>, nobuffer: bool, force: bool) 
         }
     };
     let force = force || hello.force;
+    if group_pidfd && (hello.offsets.is_some() || hello.action.is_some()) {
+        write_error_line(
+            &mut output,
+            "--group-pidfd is only for new sessions; existing sessions cannot be retrofitted",
+        )
+        .await?;
+        return Ok(1);
+    }
     if matches!(hello.action, Some(ClientAction::StdinEof)) {
         if force {
             write_error_line(&mut output, "force is only supported for data attachments").await?;
@@ -67,7 +81,7 @@ pub async fn run(id: String, command: Vec<String>, nobuffer: bool, force: bool) 
     let session_dir = runtime::session_dir(&id)?;
 
     let connection = if creating {
-        match start_broker(&id, &session_dir, &command, nobuffer).await {
+        match start_broker(&id, &session_dir, &command, nobuffer, group_pidfd).await {
             Ok(connection) => connection,
             Err(error) => {
                 write_error_line(&mut output, &error.to_string()).await?;
@@ -104,7 +118,15 @@ async fn start_broker(
     session_dir: &Path,
     command: &[String],
     nobuffer: bool,
+    group_pidfd: bool,
 ) -> Result<UnixStream> {
+    if group_pidfd {
+        // Reject a known incompatible inherited policy before session
+        // allocation or broker dispatch. Only the broker can probe its group.
+        crate::group_pidfd::GroupPidfd::check_sigchld_policy().map_err(|error| {
+            anyhow::anyhow!("group pidfd unsupported; workload not started: {error}")
+        })?;
+    }
     match fs::create_dir(session_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -123,6 +145,9 @@ async fn start_broker(
         .arg(id)
         .arg("--session-dir")
         .arg(session_dir);
+    if group_pidfd {
+        broker.arg("--group-pidfd");
+    }
     if nobuffer {
         broker.arg("--nobuffer");
     }
@@ -155,6 +180,11 @@ async fn start_broker(
             Ok(connection) => return Ok(connection),
             Err(_) if tokio::time::Instant::now() < deadline => {}
             Err(error) => {
+                if group_pidfd {
+                    // Dispatch may already have happened. Do not kill the
+                    // authority owner or remove its session on a ready timeout.
+                    bail!("session broker readiness unknown after dispatch; session retained; workload may have started; query the same session, do not retry creation");
+                }
                 let _ = child.kill();
                 let detail = fs::read_to_string(&log_path).unwrap_or_default();
                 let _ = fs::remove_dir_all(session_dir);
@@ -164,7 +194,16 @@ async fn start_broker(
                 bail!("session broker failed: {}", detail.trim());
             }
         }
-        if let Some(status) = child.try_wait()? {
+        let status = child.try_wait().map_err(|error| {
+            if group_pidfd {
+                // Even ECHILD is not observed exit or pre-dispatch rejection.
+                // Preserve the broker/session; never infer cleanup authority.
+                anyhow::anyhow!("session broker wait failed after dispatch: {error}; session retained; workload may have started; query the same session, do not retry creation")
+            } else {
+                error.into()
+            }
+        })?;
+        if let Some(status) = status {
             let detail = fs::read_to_string(&log_path).unwrap_or_default();
             let _ = fs::remove_dir_all(session_dir);
             if detail.trim().is_empty() {
@@ -414,8 +453,31 @@ pub async fn pid(id: &str) -> Result<i32> {
     Ok(0)
 }
 
-pub async fn cancel(id: &str) -> Result<i32> {
-    let response = control_request(id, "cancel").await?;
+pub async fn session(id: &str) -> Result<i32> {
+    println!("{}", control_request(id, "session").await?);
+    Ok(0)
+}
+
+pub async fn cancel(id: &str, require_group_pidfd: bool) -> Result<i32> {
+    let response = control_request(
+        id,
+        if require_group_pidfd {
+            "cancel-group-pidfd"
+        } else {
+            "cancel"
+        },
+    )
+    .await?;
+    if require_group_pidfd
+        && !response["session"]["capabilities"]
+            .as_array()
+            .is_some_and(|caps| {
+                caps.iter()
+                    .any(|cap| cap == crate::protocol::GROUP_PIDFD_CAPABILITY)
+            })
+    {
+        bail!("broker did not verify group-pidfd-cancel-v1 for this session");
+    }
     let result: ExitResult = serde_json::from_value(
         response
             .get("exit")
@@ -428,10 +490,8 @@ pub async fn cancel(id: &str) -> Result<i32> {
             .cloned()
             .context("broker returned no cancellation outcome")?,
     )?;
-    println!(
-        "{}",
-        serde_json::json!({"exit": result, "outcome": outcome})
-    );
+    let _ = outcome; // Validate existing wire outcome before forwarding additive facts.
+    println!("{response}");
     Ok(result.process_code())
 }
 
@@ -441,6 +501,8 @@ async fn control_request(id: &str, action: &str) -> Result<serde_json::Value> {
     let request = match action {
         "pid" => BrokerRequest::Pid,
         "cancel" => BrokerRequest::Cancel,
+        "cancel-group-pidfd" => BrokerRequest::CancelGroupPidfd,
+        "session" => BrokerRequest::Session,
         _ => bail!("unsupported control request {action:?}"),
     };
     write_json_line(&mut connection, &request).await?;

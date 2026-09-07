@@ -5,6 +5,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Version of the public attachment handshake and its sticky-state semantics.
 /// Compatible additions keep this number; an incompatible change bumps it.
 pub const ATTACHMENT_PROTOCOL_VERSION: u32 = 1;
+pub const GROUP_PIDFD_CAPABILITY: &str = "group-pidfd-cancel-v1";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionFact {
+    pub capabilities: Vec<String>,
+    pub workload_started: bool,
+    pub cancel_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_error: Option<String>,
+}
 
 pub const MAX_JSON_LINE: usize = 64 * 1024;
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -61,10 +71,17 @@ pub enum BrokerRequest {
     },
     Pid,
     Cancel,
+    // Distinct action: old serde brokers reject it before any signal. An
+    // optional field on Cancel would be silently ignored by old brokers.
+    #[serde(rename = "cancel-group-pidfd")]
+    CancelGroupPidfd,
+    Session,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerHello {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionFact>,
     pub offsets: AllOffsets,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub nobuffer: bool,
@@ -86,12 +103,10 @@ pub struct ExitResult {
     pub signal: Option<i32>,
 }
 
-/// Broker verdict on a cancellation request. `CancelWon` is reported only
-/// when the TERM or KILL attempt actually reached at least one remaining
-/// member of the recorded process group; a group that had already settled
-/// reports `AlreadyExited`, even when it disappeared between the request and
-/// the signal. The retained command exit result is reported alongside and is
-/// never relabeled by this verdict.
+/// `CancelWon` means at least one TERM/KILL syscall succeeded. This includes
+/// zombie-only groups and proves neither a live recipient nor historical
+/// request attribution. A later settled call returns `AlreadyExited`. The
+/// actual retained command exit is never relabeled by this verdict.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelOutcome {
