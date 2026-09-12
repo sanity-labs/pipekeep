@@ -21,8 +21,10 @@ struct AttachmentOpen {
     stdin_eof: Option<u64>,
     force: bool,
     framed: bool,
+    output_bounded: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     id: String,
     command: Vec<String>,
@@ -30,6 +32,8 @@ pub async fn run(
     force: bool,
     group_pidfd: bool,
     framed: bool,
+    output_bounded: bool,
+    output_limit: Option<u64>,
 ) -> Result<i32> {
     let mut input = tokio::io::stdin();
     let mut output = tokio::io::stdout();
@@ -48,6 +52,24 @@ pub async fn run(
         }
     };
     let force = force || hello.force;
+    if output_bounded
+        && (hello.action.is_some() || (hello.offsets.is_none() && output_limit.is_none()))
+    {
+        write_error_line(
+            &mut output,
+            "bounded creation requires --output-limit; bounded EOF uses an attachment frame",
+        )
+        .await?;
+        return Ok(1);
+    }
+    if output_limit.is_some() && hello.offsets.is_some() {
+        write_error_line(
+            &mut output,
+            "--output-limit is new-session only; no retrofit",
+        )
+        .await?;
+        return Ok(1);
+    }
     if group_pidfd && (hello.offsets.is_some() || hello.action.is_some()) {
         write_error_line(
             &mut output,
@@ -92,7 +114,16 @@ pub async fn run(
     let session_dir = runtime::session_dir(&id)?;
 
     let connection = if creating {
-        match start_broker(&id, &session_dir, &command, nobuffer, group_pidfd).await {
+        match start_broker(
+            &id,
+            &session_dir,
+            &command,
+            nobuffer,
+            group_pidfd,
+            output_limit,
+        )
+        .await
+        {
             Ok(connection) => connection,
             Err(error) => {
                 write_error_line(&mut output, &error.to_string()).await?;
@@ -120,6 +151,7 @@ pub async fn run(
             stdin_eof: hello.stdin_eof,
             force,
             framed,
+            output_bounded,
         },
     )
     .await
@@ -131,6 +163,7 @@ async fn start_broker(
     command: &[String],
     nobuffer: bool,
     group_pidfd: bool,
+    output_limit: Option<u64>,
 ) -> Result<UnixStream> {
     if group_pidfd {
         // Reject a known incompatible inherited policy before session
@@ -149,6 +182,9 @@ async fn start_broker(
     fs::set_permissions(session_dir, fs::Permissions::from_mode(0o700))?;
     let log_path = session_dir.join("broker.log");
     let log = fs::File::create(&log_path)?;
+    if output_limit.is_some() {
+        fs::write(session_dir.join("prelaunch"), b"")?;
+    }
     let executable = std::env::current_exe().context("cannot locate the pipekeep executable")?;
     let mut broker = Command::new(executable);
     broker
@@ -159,6 +195,9 @@ async fn start_broker(
         .arg(session_dir);
     if group_pidfd {
         broker.arg("--group-pidfd");
+    }
+    if let Some(limit) = output_limit {
+        broker.arg("--output-limit").arg(limit.to_string());
     }
     if nobuffer {
         broker.arg("--nobuffer");
@@ -217,6 +256,9 @@ async fn start_broker(
         })?;
         if let Some(status) = status {
             let detail = fs::read_to_string(&log_path).unwrap_or_default();
+            if output_limit.is_some() && !session_dir.join("prelaunch").exists() {
+                bail!("session broker exited after dispatch ({status}); workload may have started; session retained; do not retry creation");
+            }
             let _ = fs::remove_dir_all(session_dir);
             if detail.trim().is_empty() {
                 bail!("session broker exited during startup ({status})");
@@ -251,7 +293,14 @@ async fn proxy_attachment(
     mut broker: UnixStream,
     opening: AttachmentOpen,
 ) -> Result<i32> {
-    let request = if opening.framed {
+    let request = if opening.output_bounded {
+        BrokerRequest::AttachOutputV1 {
+            offsets: opening.offsets,
+            stdin_start: opening.stdin_start,
+            stdin_eof: opening.stdin_eof,
+            force: opening.force,
+        }
+    } else if opening.framed {
         BrokerRequest::AttachFramedV1 {
             offsets: opening.offsets,
             stdin_start: opening.stdin_start,
@@ -283,12 +332,40 @@ async fn proxy_attachment(
     }
     let hello: ServerHello = serde_json::from_slice(&response)
         .context("broker returned an invalid attachment header")?;
+    let expected = if opening.output_bounded {
+        crate::output::ATTACHMENT
+    } else {
+        FRAMED_ATTACHMENT_V1
+    };
     if opening.framed
-        && (hello.attachment.as_deref() != Some(FRAMED_ATTACHMENT_V1) || hello.nobuffer)
+        && (hello.attachment.as_deref() != Some(expected)
+            || hello.nobuffer
+            || opening.output_bounded != hello.output.is_some())
     {
         bail!(
             "broker did not confirm buffered framed-v1 attachment; no fallback; session retained"
         );
+    }
+    if opening.output_bounded {
+        let header: serde_json::Value = serde_json::from_slice(&response)?;
+        if ["exit", "stdout_eof", "stderr_eof"]
+            .iter()
+            .any(|field| header.get(field).is_some())
+        {
+            bail!("bounded attachment header contains legacy terminal facts");
+        }
+        hello
+            .output
+            .as_ref()
+            .context("missing finite output policy")?
+            .validate(false)?;
+        if !hello.session.as_ref().is_some_and(|s| {
+            s.capabilities
+                .iter()
+                .any(|c| c == crate::output::CAPABILITY)
+        }) {
+            bail!("workload may have started; finite output control unverified; session retained; do not recreate");
+        }
     }
     if opening.framed {
         if let Some(exit) = &hello.exit {
@@ -308,11 +385,13 @@ async fn proxy_attachment(
         hello,
         opening.stdin_eof,
         opening.framed,
+        opening.output_bounded,
     )
     .await
     .unwrap_or(1))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_streams(
     external_input: Stdin,
     mut external_output: Stdout,
@@ -321,10 +400,14 @@ async fn relay_streams(
     hello: ServerHello,
     stdin_eof: Option<u64>,
     framed: bool,
+    output_bounded: bool,
 ) -> Result<i32> {
     let mut stdin_position = hello.offsets.stdin;
     let mut stdout_position = hello.offsets.stdout;
     let mut stderr_position = hello.offsets.stderr;
+    // The affirmative attachment fixes the policy; progress can change facts,
+    // but cannot renegotiate its limit.
+    let output_limit = hello.output.as_ref().map(|fact| fact.limit);
     let (mut broker_read, mut broker_write) = broker.into_split();
     // Both futures live in this scope. On ANY completion or error their
     // pending reads/writes are dropped; there is no detached forwarding task.
@@ -349,7 +432,16 @@ async fn relay_streams(
     };
     let output = async {
         loop {
-            let Some(frame) = read_frame(&mut broker_read, Direction::Output).await? else {
+            let Some(frame) = read_frame(
+                &mut broker_read,
+                if output_bounded {
+                    Direction::BoundedOutput
+                } else {
+                    Direction::Output
+                },
+            )
+            .await?
+            else {
                 return Ok(if framed { 1 } else { 0 });
             };
             if framed {
@@ -371,9 +463,25 @@ async fn relay_streams(
                         }
                         stdin_position = *offset;
                     }
+                    Frame::OutputState(fact) | Frame::OutputEnd(fact) => {
+                        if Some(fact.limit) != output_limit {
+                            bail!("broker changed the finite output policy");
+                        }
+                        // Progress facts may lead replay. Only replay end must
+                        // match delivered absolute positions (including resume).
+                        if matches!(&frame, Frame::OutputEnd(_))
+                            && (fact.stdout.retained != stdout_position
+                                || fact.stderr.retained != stderr_position)
+                        {
+                            bail!("broker replay end does not match delivered output");
+                        }
+                    }
                     _ => {}
                 }
                 write_frame(&mut external_output, &frame).await?;
+                if let Frame::OutputEnd(fact) = &frame {
+                    return Ok(fact.process_code());
+                }
                 if let Frame::Exit(result) = frame {
                     return Ok(result.process_code());
                 }
@@ -511,16 +619,22 @@ pub async fn session(id: &str) -> Result<i32> {
     Ok(0)
 }
 
-pub async fn cancel(id: &str, require_group_pidfd: bool) -> Result<i32> {
+pub async fn cancel(id: &str, require_group_pidfd: bool, output_bounded: bool) -> Result<i32> {
     let response = control_request(
         id,
-        if require_group_pidfd {
+        if output_bounded {
+            "cancel-output-v1"
+        } else if require_group_pidfd {
             "cancel-group-pidfd"
         } else {
             "cancel"
         },
     )
     .await?;
+    if output_bounded && response.get("error").is_some() {
+        println!("{response}");
+        return Ok(1);
+    }
     if require_group_pidfd
         && !response["session"]["capabilities"]
             .as_array()
@@ -545,7 +659,12 @@ pub async fn cancel(id: &str, require_group_pidfd: bool) -> Result<i32> {
     )?;
     let _ = outcome; // Validate existing wire outcome before forwarding additive facts.
     println!("{response}");
-    Ok(result.process_code())
+    if output_bounded {
+        let fact: crate::output::OutputFact = serde_json::from_value(response["output"].clone())?;
+        Ok(fact.process_code())
+    } else {
+        Ok(result.process_code())
+    }
 }
 
 async fn control_request(id: &str, action: &str) -> Result<serde_json::Value> {
@@ -555,6 +674,7 @@ async fn control_request(id: &str, action: &str) -> Result<serde_json::Value> {
         "pid" => BrokerRequest::Pid,
         "cancel" => BrokerRequest::Cancel,
         "cancel-group-pidfd" => BrokerRequest::CancelGroupPidfd,
+        "cancel-output-v1" => BrokerRequest::CancelOutputV1,
         "session" => BrokerRequest::Session,
         _ => bail!("unsupported control request {action:?}"),
     };
@@ -563,7 +683,11 @@ async fn control_request(id: &str, action: &str) -> Result<serde_json::Value> {
         .await?
         .context("broker closed before its control response")?;
     let response: serde_json::Value = serde_json::from_slice(&line)?;
-    if let Some(error) = response.get("error").and_then(serde_json::Value::as_str) {
+    if let Some(error) = response
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .filter(|_| action != "cancel-output-v1")
+    {
         bail!("{error}");
     }
     Ok(response)

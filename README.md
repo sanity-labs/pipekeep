@@ -340,3 +340,126 @@ runtimes are reported explicitly. A capable local/CI gate must use
 that gate fails on unavailable support or a missing Python 3 harness. Fixtures
 use individual pidfds for cleanup and a process-local test subreaper. The broker
 itself does not become a subreaper.
+
+### Opt-in finite retained output
+
+New buffered sessions can select one shared stdout/stderr byte budget:
+
+```text
+pipekeep --id ID --output-bounded --group-pidfd --output-limit BYTES -- COMMAND [ARG...]
+pipekeep --id ID --output-bounded [--force] -- COMMAND [ARG...]
+pipekeep cancel --id ID --output-bounded
+pipekeep session --id ID
+```
+
+The first form requires a creating opening (no `offsets`). The second requires
+attach-only `offsets` and omits both creation flags. `--output-bounded` selects
+framing itself. BYTES is checked decimal in `0..9223372036854775807`; zero permits
+empty output. Buffering and verified original-group pidfd support are required.
+Always put recognized `--id ID` before new flags, including `--group-pidfd`, and
+put the command after `--`. This ordering makes old parsers reject safely.
+There is no retrofit, automatic command replay, or renewed creation right after
+a lost opening, broker death, or retention expiry.
+
+The binary advertises `opt-in-finite-output-v1`; only an opted-in session with
+verified control advertises `finite-output-v1`. Opening uses the distinct broker
+action `attach-output-v1` and confirms `attachment:"framed-output-v1"`. Legacy
+raw, framed-v1, ordinary EOF controls and ordinary cancellation actions reject
+these sessions before force takeover, stdin mutation or signaling. Bounded EOF
+intent uses the existing type-2 input frame or an aware attachment opening.
+`cancel-output-v1` joins the existing single broker operation. Unlimited and
+nobuffer session contracts are unchanged.
+
+Input frames 1/2, output bytes 3/4 and stdin receipts 5 keep their existing
+encodings and absolute offsets. Bounded attachments replace type 6 (Exit) with:
+
+| Frame | Payload | Meaning |
+| --- | --- | --- |
+| 7 | JSON `OutputFact`, at most 4096 bytes | Coalesced current retained facts |
+| 8 | JSON `OutputFact`, at most 4096 bytes | End of replay of the available prefix |
+
+An `output` fact also appears in the opening, `session` observation and aware
+cancellation response. It records the limit, immutable first resource-stop
+reason, per-stream retained/reserved/discarded bytes, typed storage fault,
+collection state (`reading`, actual `eof`, or `unconfirmed` with a cause), prefix
+completeness, outstanding filesystem work, sealing, actual leader result,
+latched original-group absence and typed group-control status. Completeness is
+false while I/O is unresolved. A replay end is never evidence of workload pipe
+EOF; the old `stdout_eof`, `stderr_eof` and `exit` opening fields are omitted for
+bounded attachments. Type 6 is rejected in this mode. An actual exit 0 with
+incomplete output yields frontend status 1, while the fact retains actual code 0.
+A nonzero code or signal is preserved. A cancellation error keeps its available
+facts in the aware JSON response. `session` can observe facts while detached or
+while an attachment's replay filesystem operation is blocked.
+
+The opening fixes the finite output policy and limit for that attachment. Later
+facts cannot change the limit. Before forwarding replay end, the frontend checks
+both retained boundaries against delivered absolute positions, including nonzero
+resume offsets. Intermediate progress facts may lead the delivered bytes.
+Bounded openings reject the presence of legacy `exit`, `stdout_eof` and
+`stderr_eof` fields before forwarding the opening or stdin.
+
+`original_group_absent` is the permanent latch for original-group absence.
+`group_control` describes the cancellation operation, and can still be `running`
+when retained collection end is emitted, before the owner's next step records
+settlement or failure. Consumers must use the absence latch for that group fact.
+
+Reservations cover both streams and pending writes before dispatch to storage.
+Only returned successful file-write counts become public offsets. First excess,
+not reaching the limit, seals admission and starts/joins TERM/grace/KILL without
+waiting for storage, output EOF or a controller. Positive-size reads remain
+possible at the exact budget. There is one collector coordinator, two 4096-byte
+write slots and two 4096-byte read buffers. With healthy storage, overflow
+consumes exactly one excess byte before pausing. A storage fault racing a normal
+read can additionally leave at most one already-read 4096-byte chunk to account.
+
+Normal reads pause until actual leader reap plus a later original-group pidfd
+ESRCH. Then one fair shared tail drain discards at most 262144 bytes in reads of
+at most 4096 bytes, for at most 200 ms, clamped to the original cancellation
+finish deadline. Output, joins and redelivery never extend deadlines. Reaching
+the byte cap without an EOF-observing read remains unconfirmed. Only a positive
+read returning zero establishes EOF. Bound exhaustion closes collectors with a
+precise cause and preserves prior group absence and actual exit. Pipe capacities
+vary; the cap is not a promise of complete collection on every pipe size.
+**Paused reads can force SIGKILL when a TERM handler tries to flush output.** This
+resource-stop tradeoff is deliberate. Escaped holders can survive both original
+group absence and collector closure; this is not whole-tree containment.
+
+A failed manual cancellation also closes finite collectors at its original
+operation deadline, even when no output policy stop occurred. This preserves the
+actual leader result and reports unconfirmed collection; escaped pipe holders
+can remain alive after that closure.
+
+Spool write/read-open and socket setup precede launch. The bounded startup
+`prelaunch` marker is removed before dispatch; an observed broker exit cannot
+justify frontend cleanup once that marker is absent. It is a local startup
+receipt, not restart recovery or launch authority. Postlaunch output/storage
+faults never use the generic failure field that aborts group-control progress.
+If postlaunch pidfd acquisition fails, collection continues within budget until
+actual EOF or an actual stop/operation requires closure. Control remains
+unavailable and bounded attachment remains refused. Overflow or a storage fault
+still closes collection as unconfirmed without fabricating group absence,
+signaling by numeric PID, or launching another command.
+
+Blocking writes and replay operations own their filesystem handles and lifetime
+pins until actual completion. Dropping their awaiting futures does not cancel
+kernel I/O, reuse reservations or authorize unlink. Replay has a single gate
+held inside its blocking worker; superseded attachments cannot accumulate
+blocking readers. Unresolved work keeps its finite reservation and can pin the
+broker indefinitely. Returned partial writes retain exact known prefixes;
+returned errors release only known unwritten reservation and latch uncertainty.
+Writes use unbuffered `std::fs::File` completion; `flush` is not `fsync` and gives
+no crash/power-loss durability promise.
+
+Once collectors have finished and storage has resolved, existing idle retention
+(default 300 seconds, hardened clamp 86400) applies after terminal output or a
+finished cancellation, including an uncertain cancellation. Active attachments,
+accepted controls and active cancellation pin retention and reset idle time.
+Expiry can discard uncertain facts; it proves neither death nor cleanup or
+creation authority. The byte limit covers logical stdout/stderr file contents,
+not metadata, broker logs, filesystem allocation overhead, aggregate sessions or
+aggregate memory. Existing input frame and connection admission bounds remain
+separate. This contract assumes the surviving broker and returning filesystem
+operations; broker/host restart, hostile same-user filesystem mutation, power
+loss and whole-tree containment are outside it. Aggregate Engine active/retained
+session admission is a separate follow-on.

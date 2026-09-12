@@ -14,10 +14,13 @@ pub enum Mode {
         force: bool,
         group_pidfd: bool,
         framed: bool,
+        output_bounded: bool,
+        output_limit: Option<u64>,
     },
     Cancel {
         id: String,
         require_group_pidfd: bool,
+        output_bounded: bool,
     },
     Session {
         id: String,
@@ -29,6 +32,7 @@ pub enum Mode {
         id: String,
         group_pidfd: bool,
         session_dir: PathBuf,
+        output_limit: Option<u64>,
         command: Vec<String>,
         nobuffer: bool,
     },
@@ -58,6 +62,9 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
     let mut force = false;
     let mut group_pidfd = false;
     let mut framed = false;
+    let mut output_bounded = false;
+    let mut group_before_id = false;
+    let mut output_limit = None;
     let index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -74,8 +81,27 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
                 args.remove(index);
             }
             "--group-pidfd" => {
+                group_before_id |= id.is_none();
                 group_pidfd = true;
                 args.remove(index);
+            }
+            "--output-bounded" => {
+                if id.is_none() {
+                    bail!("--output-bounded must follow --id ID");
+                }
+                output_bounded = true;
+                framed = true;
+                args.remove(index);
+            }
+            "--output-limit" => {
+                if id.is_none() {
+                    bail!("--output-limit must follow --id ID");
+                }
+                if output_limit.is_some() {
+                    bail!("duplicate --output-limit");
+                }
+                output_limit = Some(parse_limit(args.get(index + 1))?);
+                args.drain(index..=index + 1);
             }
             "--framed" => {
                 // Old parsers interpret an unknown leading token as an outer
@@ -103,6 +129,12 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
     if framed && (nobuffer || id.is_none()) {
         bail!("--framed requires --id and buffered sessions (no --nobuffer)");
     }
+    if output_bounded && group_before_id {
+        bail!("finite output requires --id ID before --group-pidfd");
+    }
+    if output_limit.is_some() && (!output_bounded || !group_pidfd || nobuffer) {
+        bail!("--output-limit requires --output-bounded, --group-pidfd and buffering");
+    }
     if args.is_empty() {
         bail!("a command is required");
     }
@@ -114,6 +146,8 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode> {
             force,
             group_pidfd,
             framed,
+            output_bounded,
+            output_limit,
         })
     } else {
         if group_pidfd {
@@ -140,6 +174,10 @@ fn parse_session(args: &[String]) -> Result<Mode> {
 
 fn parse_control(args: &[String], cancel: bool) -> Result<Mode> {
     let mut args = args.to_vec();
+    let output_bounded = cancel && args.iter().any(|s| s == "--output-bounded");
+    if output_bounded {
+        args.retain(|s| s != "--output-bounded");
+    }
     let require_group_pidfd = cancel && args.iter().any(|s| s == "--require-group-pidfd");
     if require_group_pidfd {
         args.retain(|s| s != "--require-group-pidfd");
@@ -151,6 +189,7 @@ fn parse_control(args: &[String], cancel: bool) -> Result<Mode> {
         Ok(Mode::Cancel {
             id: args[1].clone(),
             require_group_pidfd,
+            output_bounded,
         })
     } else {
         Ok(Mode::Pid {
@@ -162,6 +201,7 @@ fn parse_control(args: &[String], cancel: bool) -> Result<Mode> {
 fn parse_broker(args: &[String]) -> Result<Mode> {
     let mut id = None;
     let mut session_dir = None;
+    let mut output_limit = None;
     let mut group_pidfd = false;
     let mut nobuffer = false;
     let mut index = 0;
@@ -174,6 +214,13 @@ fn parse_broker(args: &[String]) -> Result<Mode> {
             "--group-pidfd" => {
                 group_pidfd = true;
                 index += 1;
+            }
+            "--output-limit" => {
+                if output_limit.is_some() {
+                    bail!("duplicate --output-limit");
+                }
+                output_limit = Some(parse_limit(args.get(index + 1))?);
+                index += 2;
             }
             "--session-dir" => {
                 session_dir = args.get(index + 1).map(PathBuf::from);
@@ -194,7 +241,11 @@ fn parse_broker(args: &[String]) -> Result<Mode> {
     if command.is_empty() {
         bail!("broker command is missing");
     }
+    if output_limit.is_some() && (!group_pidfd || nobuffer) {
+        bail!("finite output requires buffered group pidfd session");
+    }
     Ok(Mode::Broker {
+        output_limit,
         group_pidfd,
         id: id.ok_or_else(|| anyhow::anyhow!("broker ID is missing"))?,
         session_dir: session_dir
@@ -202,6 +253,18 @@ fn parse_broker(args: &[String]) -> Result<Mode> {
         command,
         nobuffer,
     })
+}
+
+fn parse_limit(value: Option<&String>) -> Result<u64> {
+    let value = value.ok_or_else(|| anyhow::anyhow!("--output-limit requires decimal bytes"))?;
+    if value.is_empty() || !value.bytes().all(|v| v.is_ascii_digit()) {
+        bail!("invalid output limit");
+    }
+    let limit = value.parse::<u64>()?;
+    if limit > i64::MAX as u64 {
+        bail!("output limit exceeds file offset range");
+    }
+    Ok(limit)
 }
 
 fn parse_capabilities(args: &[String]) -> Result<Mode> {
@@ -217,7 +280,9 @@ pub const HELP: &str = r#"pipekeep: resumable process pipes
 Usage:
   pipekeep [--nobuffer] [--] TRANSPORT [ARG...]
   pipekeep --id ID [--nobuffer] [--force] [--group-pidfd] [--framed] -- COMMAND [ARG...]
-  pipekeep cancel --id ID [--require-group-pidfd]
+  pipekeep --id ID --output-bounded --group-pidfd --output-limit BYTES -- COMMAND [ARG...]
+  pipekeep --id ID --output-bounded [--force] -- COMMAND [ARG...]
+  pipekeep cancel --id ID [--require-group-pidfd] [--output-bounded]
   pipekeep session --id ID
   pipekeep pid --id ID
   pipekeep capabilities --json
@@ -228,6 +293,11 @@ or attaches to a detached process session using the opening protocol message.
 With --id, --force applies only to attach-only opening requests and supersedes
 an existing data attachment without restarting the command.
 --framed requires buffering and carries typed frames after a versioned opening.
+--output-bounded selects policy-aware framing; creation also requires the checked
+shared decimal --output-limit (0..9223372036854775807), --group-pidfd and buffering.
+Attach-only openings omit --output-limit and --group-pidfd. Bounded sessions
+require output-aware readers and cancellation; use framed stdin EOF intent.
+Keep --id ID before new flags, and the workload after -- for old-parser safety.
 `capabilities --json` prints a machine-readable compatibility probe.
 "#;
 
@@ -245,6 +315,62 @@ mod tests {
         assert!(parse(args(&["--framed", "--id", "x", "--", "cat"])).is_err());
         assert!(parse(args(&["--id", "x", "--framed", "--nobuffer", "--", "cat"])).is_err());
         assert!(parse(args(&["--id", "x", "--nobuffer", "--framed", "--", "cat"])).is_err());
+    }
+
+    #[test]
+    fn finite_policy_is_checked_and_old_parser_safe() {
+        let args = |values: &[&str]| values.iter().map(|value| (*value).to_owned()).collect();
+        assert!(parse(args(&[
+            "--group-pidfd",
+            "--id",
+            "x",
+            "--output-bounded",
+            "--output-limit",
+            "0",
+            "--",
+            "true"
+        ]))
+        .is_err());
+        for limit in ["0", "9223372036854775807"] {
+            assert!(matches!(
+                parse(args(&[
+                    "--id",
+                    "x",
+                    "--output-bounded",
+                    "--group-pidfd",
+                    "--output-limit",
+                    limit,
+                    "--",
+                    "true"
+                ]))
+                .unwrap(),
+                Mode::Server {
+                    output_limit: Some(_),
+                    ..
+                }
+            ));
+        }
+        for limit in [
+            "-1",
+            "+1",
+            "",
+            "1k",
+            "9223372036854775808",
+            "18446744073709551616",
+        ] {
+            assert!(parse(args(&[
+                "--id",
+                "x",
+                "--output-bounded",
+                "--group-pidfd",
+                "--output-limit",
+                limit,
+                "--",
+                "true"
+            ]))
+            .is_err());
+        }
+        assert!(parse(args(&["--output-bounded", "--id", "x", "--", "true"])).is_err());
     }
 
     #[test]

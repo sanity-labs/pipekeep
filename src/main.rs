@@ -3,6 +3,7 @@ mod cancellation;
 mod cli;
 mod group_pidfd;
 mod outer;
+mod output;
 mod protocol;
 mod runtime;
 mod server;
@@ -32,20 +33,46 @@ async fn run() -> Result<i32> {
             force,
             group_pidfd,
             framed,
-        } => server::run(id, command, nobuffer, force, group_pidfd, framed).await,
+            output_bounded,
+            output_limit,
+        } => {
+            server::run(
+                id,
+                command,
+                nobuffer,
+                force,
+                group_pidfd,
+                framed,
+                output_bounded,
+                output_limit,
+            )
+            .await
+        }
         Mode::Cancel {
             id,
             require_group_pidfd,
-        } => server::cancel(&id, require_group_pidfd).await,
+            output_bounded,
+        } => server::cancel(&id, require_group_pidfd, output_bounded).await,
         Mode::Session { id } => server::session(&id).await,
         Mode::Pid { id } => server::pid(&id).await,
         Mode::Broker {
             id,
             group_pidfd,
             session_dir,
+            output_limit,
             command,
             nobuffer,
-        } => broker::run(id, session_dir, command, nobuffer, group_pidfd).await,
+        } => {
+            broker::run(
+                id,
+                session_dir,
+                command,
+                nobuffer,
+                group_pidfd,
+                output_limit,
+            )
+            .await
+        }
         Mode::Help => {
             print!("{}", cli::HELP);
             Ok(0)
@@ -73,6 +100,7 @@ fn capabilities() -> serde_json::Value {
         "protocol": protocol::ATTACHMENT_PROTOCOL_VERSION,
         "capabilities": [
             "raw-public-streams",
+            "opt-in-finite-output-v1",
             protocol::FRAMED_ATTACHMENT_V1,
             "absolute-resume-offsets",
             "sticky-stdin-eof",

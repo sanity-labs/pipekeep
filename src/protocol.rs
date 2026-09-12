@@ -1,3 +1,4 @@
+use crate::output::OutputFact;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -67,6 +68,19 @@ pub enum BrokerRequest {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         force: bool,
     },
+    #[serde(rename = "attach-output-v1")]
+    AttachOutputV1 {
+        #[serde(default)]
+        offsets: OutputOffsets,
+        #[serde(default)]
+        stdin_start: u64,
+        #[serde(default)]
+        stdin_eof: Option<u64>,
+        #[serde(default)]
+        force: bool,
+    },
+    #[serde(rename = "cancel-output-v1")]
+    CancelOutputV1,
     // A distinct action makes old brokers reject before installing a lease.
     #[serde(rename = "attach-framed-v1")]
     AttachFramedV1 {
@@ -94,6 +108,8 @@ pub enum BrokerRequest {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerHello {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<OutputFact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,6 +182,8 @@ pub enum Frame {
     StderrData { offset: u64, data: Vec<u8> },
     StdinPosition { offset: u64 },
     Exit(ExitResult),
+    OutputState(OutputFact),
+    OutputEnd(OutputFact),
 }
 
 pub async fn read_line<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Vec<u8>>> {
@@ -209,6 +227,8 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
         Frame::StderrData { offset, data } => (4, offset_payload(*offset, data)?),
         Frame::StdinPosition { offset } => (5, offset.to_be_bytes().to_vec()),
         Frame::Exit(result) => (6, serde_json::to_vec(result)?),
+        Frame::OutputState(fact) => (7, serde_json::to_vec(fact)?),
+        Frame::OutputEnd(fact) => (8, serde_json::to_vec(fact)?),
     };
     if payload.len() > MAX_FRAME {
         bail!("frame is too large");
@@ -226,6 +246,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
 pub enum Direction {
     Input,
     Output,
+    BoundedOutput,
 }
 
 pub fn checked_end(offset: u64, length: usize) -> Result<u64> {
@@ -238,6 +259,7 @@ fn validate_header(kind: u8, length: usize, direction: Direction) -> Result<()> 
     let allowed = match direction {
         Direction::Input => matches!(kind, 1 | 2),
         Direction::Output => matches!(kind, 3..=6),
+        Direction::BoundedOutput => matches!(kind, 3..=5 | 7 | 8),
     };
     if !allowed {
         bail!("frame has invalid direction or type");
@@ -246,6 +268,7 @@ fn validate_header(kind: u8, length: usize, direction: Direction) -> Result<()> 
         1 | 3 | 4 => (8..=MAX_FRAME).contains(&length),
         2 | 5 => length == 8,
         6 => (1..=256).contains(&length),
+        7 | 8 => (1..=4096).contains(&length),
         _ => false,
     };
     if !valid {
@@ -293,6 +316,15 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
             result.validate()?;
             Frame::Exit(result)
         }
+        7 | 8 => {
+            let fact: OutputFact = serde_json::from_slice(&payload)?;
+            fact.validate(header[0] == 8)?;
+            if header[0] == 8 {
+                Frame::OutputEnd(fact)
+            } else {
+                Frame::OutputState(fact)
+            }
+        }
         other => bail!("unknown frame type {other}"),
     };
     Ok(Some(frame))
@@ -332,6 +364,11 @@ mod tests {
 
     #[test]
     fn header_limits_and_checked_ranges() {
+        assert!(validate_header(7, 256, Direction::Output).is_err());
+        assert!(validate_header(8, 256, Direction::Output).is_err());
+        assert!(validate_header(6, 16, Direction::BoundedOutput).is_err());
+        assert!(validate_header(8, 4096, Direction::BoundedOutput).is_ok());
+        assert!(validate_header(8, 4097, Direction::BoundedOutput).is_err());
         for kind in [1, 3, 4] {
             let direction = if kind == 1 {
                 Direction::Input
