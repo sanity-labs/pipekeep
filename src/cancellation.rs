@@ -1,5 +1,6 @@
 //! One broker-owned operation. Requests only join it; they never own signals.
 use crate::group_pidfd::GroupSignal;
+use crate::output::{ControlFault, GroupControl};
 use crate::protocol::{CancelOutcome, ExitResult, SessionFact, GROUP_PIDFD_CAPABILITY};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -23,6 +24,8 @@ pub struct Cancellation {
     grace_deadline: Option<Instant>,
     finish_deadline: Option<Instant>,
     signaled: bool,
+    group_absent: bool,
+    fault: Option<ControlFault>,
     pub result: Option<Completion>,
 }
 
@@ -32,6 +35,7 @@ impl Cancellation {
         if let Some(handle) = &state.handle {
             if let Err(error) = handle.signal(0) {
                 state.verified = false;
+                state.fault = Some(ControlFault::Unavailable);
                 state.fail(format!("workload started; group pidfd acquisition/verification failed: {error}; session retained; cancellation unavailable; do not retry creation"));
             }
         }
@@ -54,8 +58,27 @@ impl Cancellation {
             grace_deadline: None,
             finish_deadline: None,
             signaled: false,
+            group_absent: false,
+            fault: error.as_ref().map(|_| ControlFault::Unavailable),
             result: error.map(Err),
         }
+    }
+
+    pub fn output_control(&self) -> GroupControl {
+        match self.phase {
+            Phase::Ready => GroupControl::Ready,
+            Phase::Term | Phase::Kill | Phase::NoSignal => GroupControl::Running,
+            Phase::Complete => GroupControl::Settled,
+            Phase::Failed => {
+                GroupControl::Unconfirmed(self.fault.unwrap_or(ControlFault::Unavailable))
+            }
+        }
+    }
+    pub fn group_absent(&self) -> bool {
+        self.group_absent
+    }
+    pub fn finish_deadline(&self) -> Option<Instant> {
+        self.finish_deadline
     }
 
     pub fn fact(&self) -> SessionFact {
@@ -119,16 +142,19 @@ impl Cancellation {
             return;
         }
         if let Some(error) = failure {
+            self.fault = Some(ControlFault::Wait);
             self.fail(error);
             return;
         }
         if now >= self.finish_deadline.expect("active operation deadline") {
+            self.fault = Some(ControlFault::Deadline);
             self.fail("cancellation unresolved: settlement deadline expired; no further signals will be attempted".into());
             return;
         }
         if self.phase != Phase::NoSignal {
             let result = self.advance_group(now, exit.is_some(), first);
             if let Err(error) = result {
+                self.fault = Some(ControlFault::Signal);
                 self.fail(format!("cancellation unresolved: group pidfd syscall failed: {error}; no further signals will be attempted"));
                 return;
             }
@@ -152,6 +178,7 @@ impl Cancellation {
             // A living leader can leave and recreate its group. Only this
             // conjunction makes absence permanent. Publish no-signal BEFORE
             // close, while still holding the same broker mutex.
+            self.group_absent = true;
             self.phase = Phase::NoSignal;
             self.handle.take();
             return Ok(());

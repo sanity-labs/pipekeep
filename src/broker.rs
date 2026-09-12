@@ -1,5 +1,7 @@
+mod bounds;
 use crate::cancellation::Cancellation;
 use crate::group_pidfd::{GroupPidfd, GroupSignal};
+use crate::output::{self, OutputFact};
 use crate::protocol::{
     checked_end, read_frame, read_line, write_error_line, write_frame, write_json_line, AllOffsets,
     BrokerRequest, CancelOutcome, Direction, ExitResult, Frame, OutputOffsets, ServerHello,
@@ -66,10 +68,13 @@ struct Meta {
     stderr_closed: bool,
     status: Option<ExitResult>,
     failure: Option<String>,
+    output: Option<OutputFact>,
 }
 
 struct Shared {
     meta: StdMutex<Meta>,
+    replay_gate: Arc<Mutex<()>>,
+    output_bounded: bool,
     child_stdin: Mutex<Option<ChildStdin>>,
     changed: Notify,
     terminal: watch::Sender<bool>,
@@ -142,19 +147,37 @@ pub async fn run(
     command: Vec<String>,
     nobuffer: bool,
     group_pidfd: bool,
+    output_limit: Option<u64>,
 ) -> Result<i32> {
     // Pre-dispatch rejection leaves the startup log for the creating proxy
     // to read and remove. Once dispatch is possible the broker owns cleanup.
+    if output_limit.is_some() && (!group_pidfd || nobuffer) {
+        bail!("finite output requires buffered group pidfd support; workload not started");
+    }
+    if output_limit.is_some() {
+        fs::write(session_dir.join("prelaunch"), b"")
+            .context("prelaunch setup; workload not started")?;
+    }
     if group_pidfd {
         GroupPidfd::preflight().context("group pidfd unsupported; workload not started")?;
     }
-    let _guard = SessionGuard(session_dir.clone());
+    let _legacy_guard = output_limit
+        .is_none()
+        .then(|| SessionGuard(session_dir.clone()));
     fs::set_permissions(&session_dir, fs::Permissions::from_mode(0o700))?;
 
     let stdout_path = session_dir.join("stdout.buffer");
     let stderr_path = session_dir.join("stderr.buffer");
-    fs::File::create(&stdout_path)?;
-    fs::File::create(&stderr_path)?;
+    let stdout_spool =
+        fs::File::create(&stdout_path).context("storage_open stdout; workload not started")?;
+    let stderr_spool =
+        fs::File::create(&stderr_path).context("storage_open stderr; workload not started")?;
+
+    if output_limit.is_some() {
+        fs::File::open(&stdout_path).context("storage_open stdout replay; workload not started")?;
+        fs::File::open(&stderr_path).context("storage_open stderr replay; workload not started")?;
+    }
+    let spools = output_limit.map(|_| (stdout_spool, stderr_spool));
 
     // All fallible session/socket setup precedes workload dispatch.
     let socket_path = runtime::socket_path(&session_dir);
@@ -165,6 +188,10 @@ pub async fn run(
         session_dir.join("broker.pid"),
         std::process::id().to_string(),
     )?;
+    if output_limit.is_some() {
+        fs::remove_file(session_dir.join("prelaunch"))
+            .context("prelaunch transition; workload not started")?;
+    }
     let mut child_command = Command::new(&command[0]);
     child_command
         .args(&command[1..])
@@ -230,6 +257,9 @@ pub async fn run(
             let wait = tokio::spawn(async move { child.wait().await });
             (pid, stdin, stdout, stderr, None, wait, None)
         };
+    let _bounded_guard = output_limit
+        .is_some()
+        .then(|| SessionGuard(session_dir.clone()));
     // A metadata write failure after dispatch must not destroy the broker.
     if let Err(error) = fs::write(session_dir.join("command.pid"), command_pid.to_string()) {
         eprintln!("workload started; cannot write informational command.pid: {error}");
@@ -238,9 +268,17 @@ pub async fn run(
     let (terminal_tx, terminal_rx) = watch::channel(false);
     let (stdout_live, _) = broadcast::channel(64);
     let (stderr_live, _) = broadcast::channel(64);
+    let bounded_setup_failed = output_limit.is_some() && setup_failure.is_some();
     let shared = Arc::new(Shared {
+        replay_gate: Arc::new(Mutex::new(())),
+        output_bounded: output_limit.is_some(),
         meta: StdMutex::new(Meta {
-            failure: setup_failure,
+            failure: if output_limit.is_none() {
+                setup_failure
+            } else {
+                None
+            },
+            output: output_limit.map(OutputFact::new),
             ..Meta::default()
         }),
         child_stdin: Mutex::new(child_stdin),
@@ -260,11 +298,24 @@ pub async fn run(
         active_attachments: AtomicUsize::new(0),
     });
 
-    if let Some(stdout) = child_stdout {
-        tokio::spawn(drain_output(stdout, Stream::Stdout, shared.clone()));
+    if bounded_setup_failed {
+        bounds::stop(&shared, output::StopReason::PipeSetupFault);
     }
-    if let Some(stderr) = child_stderr {
-        tokio::spawn(drain_output(stderr, Stream::Stderr, shared.clone()));
+    if let Some((stdout_spool, stderr_spool)) = spools {
+        tokio::spawn(bounds::collect(
+            child_stdout,
+            child_stderr,
+            stdout_spool,
+            stderr_spool,
+            shared.clone(),
+        ));
+    } else {
+        if let Some(stdout) = child_stdout {
+            tokio::spawn(drain_output(stdout, Stream::Stdout, shared.clone()));
+        }
+        if let Some(stderr) = child_stderr {
+            tokio::spawn(drain_output(stderr, Stream::Stderr, shared.clone()));
+        }
     }
     let wait_shared = shared.clone();
     tokio::spawn(async move {
@@ -355,10 +406,7 @@ pub async fn run(
                 // Admission and expiry share THIS accept loop. An accepted
                 // connection pins the broker until its cancel is marked active;
                 // the independent operation then pins it across disconnection.
-                let cancel = shared.cancellation.as_ref().expect("opt-in state")
-                    .lock().expect("cancellation poisoned");
-                let busy = shared.active_attachments.load(Ordering::Acquire) != 0 || cancel.active();
-                let eligible = *shared.terminal.borrow() || cancel.finished();
+                let (busy, eligible) = hardened_lifetime_state(&shared);
                 if hardened_expired(&mut idle_since, tokio::time::Instant::now(), ttl, busy, eligible) { break; }
             }
         }
@@ -461,6 +509,40 @@ async fn handle_connection(mut stream: UnixStream, shared: Arc<Shared>) -> Resul
         .await?
         .context("connection ended before its broker request")?;
     let request: BrokerRequest = serde_json::from_slice(&line).context("invalid broker request")?;
+    let bounded = shared
+        .meta
+        .lock()
+        .expect("metadata poisoned")
+        .output
+        .is_some();
+    if bounded
+        && matches!(
+            request,
+            BrokerRequest::Attach { .. }
+                | BrokerRequest::AttachFramedV1 { .. }
+                | BrokerRequest::StdinEof { .. }
+                | BrokerRequest::Cancel
+                | BrokerRequest::CancelGroupPidfd
+        )
+    {
+        return write_error_line(
+            &mut stream,
+            "finite-output-v1 session requires affirmative output-aware action; no mutation",
+        )
+        .await;
+    }
+    if !bounded
+        && matches!(
+            request,
+            BrokerRequest::AttachOutputV1 { .. } | BrokerRequest::CancelOutputV1
+        )
+    {
+        return write_error_line(
+            &mut stream,
+            "session did not opt into finite-output-v1; no retrofit or mutation",
+        )
+        .await;
+    }
     match request {
         BrokerRequest::Pid => {
             write_json_line(&mut stream, &serde_json::json!({"pid": shared.command_pid})).await
@@ -470,11 +552,11 @@ async fn handle_connection(mut stream: UnixStream, shared: Arc<Shared>) -> Resul
                 let meta = shared.meta.lock().expect("metadata state poisoned");
                 serde_json::json!({"pid": shared.command_pid, "session": session_fact(&shared),
                     "leader_exit": meta.status, "stdout_closed": meta.stdout_closed,
-                    "stderr_closed": meta.stderr_closed, "failure": meta.failure})
+                    "stderr_closed": meta.stderr_closed, "failure": meta.failure, "output": bounds::fact(&shared, &meta)})
             };
             write_json_line(&mut stream, &response).await
         }
-        BrokerRequest::Cancel | BrokerRequest::CancelGroupPidfd => {
+        BrokerRequest::Cancel | BrokerRequest::CancelGroupPidfd | BrokerRequest::CancelOutputV1 => {
             let required = matches!(request, BrokerRequest::CancelGroupPidfd);
             let result = if shared.cancellation.is_some() {
                 cancel_hardened(shared.clone()).await
@@ -489,10 +571,24 @@ async fn handle_connection(mut stream: UnixStream, shared: Arc<Shared>) -> Resul
                 Ok((outcome, result)) => {
                     let mut response = serde_json::json!({"exit": result, "outcome": outcome});
                     if let Some(fact) = session_fact(&shared) { response["session"] = serde_json::to_value(fact)?; }
+                    if bounded { response["output"] = serde_json::to_value(bounds::snapshot(&shared))?; }
                     write_json_line(&mut stream, &response).await
                 }
-                Err(error) => write_json_line(&mut stream, &serde_json::json!({"error": error.to_string(), "session": session_fact(&shared)})).await,
+                Err(error) => write_json_line(&mut stream, &serde_json::json!({"error": error.to_string(), "session": session_fact(&shared), "output": bounds::snapshot(&shared)})).await,
             }
+        }
+        BrokerRequest::AttachOutputV1 {
+            offsets,
+            stdin_start,
+            stdin_eof,
+            force,
+        } => {
+            if !session_fact(&shared)
+                .is_some_and(|s| s.capabilities.iter().any(|c| c == output::CAPABILITY))
+            {
+                return write_json_line(&mut stream, &serde_json::json!({"error":"workload started; finite output control unverified; session retained; do not retry creation", "output":bounds::snapshot(&shared)})).await;
+            }
+            attach(stream, shared, offsets, stdin_start, stdin_eof, force, true).await
         }
         BrokerRequest::Attach {
             offsets,
@@ -626,8 +722,17 @@ async fn attach(
         } else {
             offsets.stderr
         };
+        let bounded = meta.output.is_some();
         ServerHello {
-            attachment: framed.then(|| FRAMED_ATTACHMENT_V1.to_owned()),
+            output: bounds::fact(&shared, &meta),
+            attachment: framed.then(|| {
+                if bounded {
+                    output::ATTACHMENT
+                } else {
+                    FRAMED_ATTACHMENT_V1
+                }
+                .to_owned()
+            }),
             stdin_eof_at: if framed { meta.stdin_eof_at } else { None },
             session: session_fact(&shared),
             offsets: AllOffsets {
@@ -637,12 +742,12 @@ async fn attach(
             },
             nobuffer: shared.nobuffer,
             stdin_eof: meta.stdin_eof,
-            stdout_eof: meta.stdout_closed.then_some(meta.stdout_end),
-            stderr_eof: meta.stderr_closed.then_some(meta.stderr_end),
+            stdout_eof: (meta.stdout_closed && !bounded).then_some(meta.stdout_end),
+            stderr_eof: (meta.stderr_closed && !bounded).then_some(meta.stderr_end),
             exit: meta
                 .status
                 .clone()
-                .filter(|_| meta.stdout_closed && meta.stderr_closed),
+                .filter(|_| meta.stdout_closed && meta.stderr_closed && !bounded),
         }
     };
     if !shared.is_current_attachment(generation) {
@@ -997,6 +1102,23 @@ async fn send_buffered_output<W: tokio::io::AsyncWrite + Unpin>(
     mut stderr_position: u64,
     mut acknowledgements: watch::Receiver<u64>,
 ) -> Result<()> {
+    if shared
+        .meta
+        .lock()
+        .expect("metadata poisoned")
+        .output
+        .is_some()
+    {
+        return bounds::send_output(
+            writer,
+            shared,
+            generation,
+            stdout_position,
+            stderr_position,
+            acknowledgements,
+        )
+        .await;
+    }
     let stdout_file = fs::File::open(&shared.stdout_path)?;
     let stderr_file = fs::File::open(&shared.stderr_path)?;
     let mut prefer_stdout = true;
@@ -1257,10 +1379,13 @@ async fn send_live_chunk<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 fn session_fact(shared: &Shared) -> Option<crate::protocol::SessionFact> {
-    shared
-        .cancellation
-        .as_ref()
-        .map(|c| c.lock().expect("cancellation poisoned").fact())
+    shared.cancellation.as_ref().map(|c| {
+        let mut fact = c.lock().expect("cancellation poisoned").fact();
+        if shared.output_bounded && !fact.capabilities.is_empty() {
+            fact.capabilities.push(output::CAPABILITY.into());
+        }
+        fact
+    })
 }
 
 fn env_seconds(name: &str, default: u64) -> u64 {
@@ -1270,6 +1395,24 @@ fn env_seconds(name: &str, default: u64) -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(default)
         .min(86400)
+}
+
+fn hardened_lifetime_state(shared: &Shared) -> (bool, bool) {
+    let meta = shared.meta.lock().expect("metadata poisoned");
+    let cancel = shared
+        .cancellation
+        .as_ref()
+        .expect("opt-in state")
+        .lock()
+        .expect("cancellation poisoned");
+    let policy_busy = meta
+        .output
+        .as_ref()
+        .is_some_and(|p| p.io_inflight != 0 || !p.collected());
+    (
+        shared.active_attachments.load(Ordering::Acquire) != 0 || cancel.active() || policy_busy,
+        *shared.terminal.borrow() || cancel.finished(),
+    )
 }
 
 fn hardened_expired(
@@ -1286,18 +1429,22 @@ fn hardened_expired(
     now.duration_since(*idle_since.get_or_insert(now)) >= ttl
 }
 
-async fn cancel_hardened(shared: Arc<Shared>) -> Result<(CancelOutcome, ExitResult)> {
+fn start_hardened(shared: &Arc<Shared>) -> bool {
+    start_hardened_with(
+        shared,
+        Duration::from_secs(env_seconds("PIPEKEEP_CANCEL_GRACE_SECS", 3)),
+        Duration::from_secs(env_seconds("PIPEKEEP_CANCEL_SETTLE_SECS", 30).max(1)),
+    )
+}
+
+fn start_hardened_with(shared: &Arc<Shared>, grace: Duration, settlement: Duration) -> bool {
     let first = shared
         .cancellation
         .as_ref()
         .expect("opt-in state")
         .lock()
         .expect("cancellation poisoned")
-        .start(
-            tokio::time::Instant::now(),
-            Duration::from_secs(env_seconds("PIPEKEEP_CANCEL_GRACE_SECS", 3)),
-            Duration::from_secs(env_seconds("PIPEKEEP_CANCEL_SETTLE_SECS", 30).max(1)),
-        );
+        .start(tokio::time::Instant::now(), grace, settlement);
     if first {
         let owner = shared.clone();
         tokio::spawn(async move {
@@ -1336,6 +1483,11 @@ async fn cancel_hardened(shared: Arc<Shared>) -> Result<(CancelOutcome, ExitResu
             }
         });
     }
+    first
+}
+
+async fn cancel_hardened(shared: Arc<Shared>) -> Result<(CancelOutcome, ExitResult)> {
+    let first = start_hardened(&shared);
     loop {
         let changed = shared.changed.notified();
         tokio::pin!(changed);
@@ -1456,6 +1608,8 @@ mod tests {
             let (stderr_live, _) = broadcast::channel(4);
             Self {
                 shared: Arc::new(Shared {
+                    replay_gate: Arc::new(Mutex::new(())),
+                    output_bounded: false,
                     meta: StdMutex::new(Meta::default()),
                     child_stdin: Mutex::new(Some(child_stdin)),
                     changed: Notify::new(),
